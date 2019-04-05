@@ -22,8 +22,10 @@ import pickle
 import random
 from abc import ABC, abstractmethod
 from collections import OrderedDict
+from collections import Counter
+from collections import defaultdict
 from contextlib import ExitStack
-from typing import Any, cast, Dict, Iterator, Iterable, List, Optional, Sequence, Sized, Tuple, Set
+from typing import Any, cast, Dict, Iterator, Iterable, List, Optional, Sequence, Sized, Tuple
 
 import mxnet as mx
 import numpy as np
@@ -83,28 +85,6 @@ def define_parallel_buckets(max_seq_len_source: int,
         target_buckets += [target_buckets[-1] for _ in range(len(source_buckets) - len(target_buckets))]
     # minimum bucket size is 2 (as we add BOS symbol to target side)
     source_buckets = [max(2, b) for b in source_buckets]
-    target_buckets = [max(2, b) for b in target_buckets]
-    parallel_buckets = list(zip(source_buckets, target_buckets))
-    # deduplicate for return
-    buckets = list(OrderedDict.fromkeys(parallel_buckets))
-    buckets.sort()
-    return buckets
-
-
-def define_empty_source_parallel_buckets(max_seq_len_target: int,
-                                         bucket_width: int = 10) -> List[Tuple[int, int]]:
-    """
-    Returns (source, target) buckets up to (None, max_seq_len_target). The source
-    is empty since it is supposed to not contain data that can be bucketized.
-    The target is used as reference to create the buckets.
-
-    :param max_seq_len_target: Maximum target bucket size.
-    :param bucket_width: Width of buckets on longer side.
-    """
-    target_step_size = max(1, bucket_width)
-    target_buckets = define_buckets(max_seq_len_target, step=target_step_size)
-    # source buckets are always 0 since there is no text
-    source_buckets = [0 for b in target_buckets]
     target_buckets = [max(2, b) for b in target_buckets]
     parallel_buckets = list(zip(source_buckets, target_buckets))
     # deduplicate for return
@@ -187,11 +167,10 @@ def define_bucket_batch_sizes(buckets: List[Tuple[int, int]],
             batch_size_seq = batch_size
             batch_size_word = batch_size_seq * average_seq_len
         bucket_batch_sizes.append(BucketBatchSize(bucket, batch_size_seq, batch_size_word))
-        # Track largest number of source or target word samples in a batch
-        largest_total_num_words = max(largest_total_num_words, batch_size_seq * max(*bucket))
+        # Track largest number of target word samples in a batch
+        largest_total_num_words = max(largest_total_num_words, batch_size_seq * padded_seq_len)
 
-    # Final step: guarantee that largest bucket by sequence length also has a batch size so that it covers any
-    # (batch_size, len_source) and (batch_size, len_target) matrix from the data iterator to allow for memory sharing.
+    # Final step: guarantee that largest bucket by sequence length also has largest total batch size.
     # When batching by sentences, this will already be the case.
     if batch_by_words:
         padded_seq_len = max(*buckets[-1])
@@ -230,10 +209,7 @@ def calculate_length_statistics(source_iterables: Sequence[Iterable[Any]],
 
     num_sents = mean_and_variance.count
     mean = mean_and_variance.mean
-    if not math.isnan(mean_and_variance.variance):
-        std = math.sqrt(mean_and_variance.variance)
-    else:
-        std = 0.0
+    std = math.sqrt(mean_and_variance.variance)
     return LengthStatistics(num_sents, mean, std)
 
 
@@ -258,15 +234,6 @@ def analyze_sequence_lengths(sources: List[str],
     return length_statistics
 
 
-def are_none(sequences: Sequence[Sized]) -> bool:
-    """
-    Returns True if all sequences are None.
-    """
-    if not sequences:
-        return True
-    return all(s is None for s in sequences)
-
-
 def are_token_parallel(sequences: Sequence[Sized]) -> bool:
     """
     Returns True if all sequences in the list have the same length.
@@ -280,7 +247,7 @@ class DataStatisticsAccumulator:
 
     def __init__(self,
                  buckets: List[Tuple[int, int]],
-                 vocab_source: Optional[Dict[str, int]],
+                 vocab_source: Dict[str, int],
                  vocab_target: Dict[str, int],
                  length_ratio_mean: float,
                  length_ratio_std: float) -> None:
@@ -288,13 +255,9 @@ class DataStatisticsAccumulator:
         num_buckets = len(buckets)
         self.length_ratio_mean = length_ratio_mean
         self.length_ratio_std = length_ratio_std
-        if vocab_source is not None:
-            self.unk_id_source = vocab_source[C.UNK_SYMBOL]
-            self.size_vocab_source = len(vocab_source)
-        else:
-            self.unk_id_source = None
-            self.size_vocab_source = 0
+        self.unk_id_source = vocab_source[C.UNK_SYMBOL]
         self.unk_id_target = vocab_target[C.UNK_SYMBOL]
+        self.size_vocab_source = len(vocab_source)
         self.size_vocab_target = len(vocab_target)
         self.num_sents = 0
         self.num_discarded = 0
@@ -325,8 +288,7 @@ class DataStatisticsAccumulator:
         self.max_observed_len_source = max(source_len, self.max_observed_len_source)
         self.max_observed_len_target = max(target_len, self.max_observed_len_target)
 
-        if self.unk_id_source is not None:
-            self.num_unks_source += source.count(self.unk_id_source)
+        self.num_unks_source += source.count(self.unk_id_source)
         self.num_unks_target += target.count(self.unk_id_target)
 
     @property
@@ -362,7 +324,9 @@ def shard_data(source_fnames: List[str],
                buckets: List[Tuple[int, int]],
                length_ratio_mean: float,
                length_ratio_std: float,
-               output_prefix: str) -> Tuple[List[Tuple[List[str], str, 'DataStatistics']], 'DataStatistics']:
+               output_prefix: str,
+               samples_per_shard: int,
+               curriculum_score_file: str) -> Tuple[List[Tuple[List[str], str, 'DataStatistics']], 'DataStatistics']:
     """
     Assign int-coded source/target sentence pairs to shards at random.
 
@@ -397,7 +361,67 @@ def shard_data(source_fnames: List[str],
         source_readers, target_reader = create_sequence_readers(source_fnames, target_fname,
                                                                 source_vocabs, target_vocab)
 
-        random_shard_iter = iter(lambda: random.randrange(num_shards), None)
+        # if curriculum learning is turned on,
+        # then put sentence to the shard with corresponding complexity score.
+        if curriculum_score_file:
+            with open(curriculum_score_file, 'r') as curriculum_score_file:
+                sample_scores = [int(line.strip()) for line in curriculum_score_file.readlines() if line.strip()]
+
+            # sample_shard_mapping: a list stores the mapping relation between sample and shard
+            # index is the index of sample
+            # each element is the shard the sentence will be put into
+            sample_shard_mapping = list(sample_scores)
+
+            # shard_score_mapping: a list stores the mapping relation between shards and complexity scores
+            # index is the index of shard
+            # each element is the complexity score of the shard
+            shard_score_mapping = list(range(num_shards))
+
+            # unique_scores: a sorted list stores unique complexity scores
+            unique_scores = sorted(set(sample_scores))
+
+            # score_index_dict: {score 0: [sample_index...], score 1: [sample_index..]...}
+            score_sample_dict = defaultdict(list)
+            for i in range(len(sample_scores)):
+                score_sample_dict[sample_scores[i]].append(i) 
+
+
+            if num_shards > len(unique_scores):
+                shard_count = 0
+                # if num_shards is multiple of number of unique scores,
+                # samples with different complexity scores should be put into shards of equal numbers
+                if num_shards%len(unique_scores) == 0:
+                    num_shards_per_score = int(num_shards/len(unique_scores))         
+                    for us in unique_scores:
+                        for sublist in np.array_split(np.array(score_sample_dict[us]),num_shards_per_score):
+                            for index in sublist:
+                                sample_shard_mapping[index] = shard_count 
+                            shard_score_mapping[shard_count] = us
+                            shard_count += 1
+
+                # if num_shards is not multiple of number of unique scores,
+                # samples will be allocated according to samples_per_shard
+                else:
+                    for us in unique_scores:
+                        sample_count = 0
+                        for index in sorted(score_sample_dict[us]):
+                            sample_shard_mapping[index] = shard_count
+                            sample_count += 1
+                            if sample_count==samples_per_shard:
+                                shard_score_mapping[shard_count] = us
+                                shard_count += 1
+                                sample_count = 0
+                        if sample_count < samples_per_shard:
+                            shard_score_mapping[shard_count] = us
+                            shard_count += 1
+                                
+
+            with open(os.path.join(output_prefix, 'shard_scores'), 'w') as shard_scores_file:
+                for m in shard_score_mapping:
+                    shard_scores_file.write(str(m)+'\n')
+            random_shard_iter = iter(sample_shard_mapping)
+        else:
+            random_shard_iter = iter(lambda: random.randrange(num_shards), None)
 
         for (sources, target), random_shard_index in zip(parallel_iter(source_readers, target_reader),
                                                          random_shard_iter):
@@ -432,7 +456,6 @@ class RawParallelDatasetLoader:
     :param eos_id: End-of-sentence id.
     :param pad_id: Padding id.
     :param eos_id: Unknown id.
-    :param skip_blanks: Whether to skip blank lines.
     :param dtype: Data type.
     """
 
@@ -440,12 +463,10 @@ class RawParallelDatasetLoader:
                  buckets: List[Tuple[int, int]],
                  eos_id: int,
                  pad_id: int,
-                 skip_blanks: bool = True,
                  dtype: str = 'float32') -> None:
         self.buckets = buckets
         self.eos_id = eos_id
         self.pad_id = pad_id
-        self.skip_blanks = skip_blanks
         self.dtype = dtype
 
     def load(self,
@@ -472,19 +493,12 @@ class RawParallelDatasetLoader:
         num_pad_target = 0
 
         # Bucket sentences as padded np arrays
-        for sentno, (sources, target) in enumerate(parallel_iter(source_iterables, target_iterable, skip_blanks=self.skip_blanks), 1):
-            sources = [[] if stream is None else stream for stream in sources]
-            if target is None:
-                target = []
+        for sources, target in parallel_iter(source_iterables, target_iterable):
             source_len = len(sources[0])
             target_len = len(target)
             buck_index, buck = get_parallel_bucket(self.buckets, source_len, target_len)
             if buck is None:
-                if self.skip_blanks:
-                    continue  # skip this sentence pair
-                else:
-                    buck_index = len(self.buckets)
-                    buck = self.buckets[buck_index]
+                continue  # skip this sentence pair
 
             num_tokens_source += buck[0]
             num_tokens_target += buck[1]
@@ -516,7 +530,43 @@ class RawParallelDatasetLoader:
         return ParallelDataSet(data_source, data_target, data_label)
 
 
-def get_num_shards(num_samples: int, samples_per_shard: int, min_num_shards: int) -> int:
+def check_score_file(num_samples: int, curriculum_score_file: str):
+    """
+    Checks the sanity of the curriculum score file. 
+
+    :param num_samples: Number of training data samples.
+    :param curriculum_score_file: Path to curriculum score file.
+    :return: True if the file is legal otherwise raise an error.
+    """
+    # check the existence of curriculum score file
+    if not os.path.exists(curriculum_score_file):
+        raise IOError('Curriculum score file not found.')
+
+    # if the curriculum score file exists, read the file
+    with open(curriculum_score_file, 'r') as curriculum_score_file:
+        sample_scores = [line.strip() for line in curriculum_score_file.readlines() if line.strip()]
+
+    # check whether the number of samples is the same as the number of scores in the curriculum score file
+    if len(sample_scores) != num_samples:
+        raise ValueError('Number of sample scores in curriculum score file does not match number of samples')
+
+    # check whether the curriculum score file only contains integers
+    if not all([s.isdigit() for s in sample_scores]):
+        raise TypeError('Curriculum score file contains non-integer')
+
+    sample_scores = sorted(set([int(s) for s in sample_scores]))
+    # check whether scores in the curriculum score file starts from 0
+    if sample_scores[0] != 0:
+        raise ValueError('Scores in curriculum score file does not start from 0')
+
+    # check whether scores in the curriculum score file are continuous integers
+    if not all([(sample_scores[i+1]-sample_scores[i])==1 for i in range(len(sample_scores)-1)]):
+        raise ValueError('Scores in curriculum score file are not continuous integers')
+
+    return True
+
+
+def get_num_shards(num_samples: int, samples_per_shard: int, min_num_shards: int, curriculum_score_file: str) -> int:
     """
     Returns the number of shards.
 
@@ -525,6 +575,21 @@ def get_num_shards(num_samples: int, samples_per_shard: int, min_num_shards: int
     :param min_num_shards: Minimum number of shards.
     :return: Number of shards.
     """
+    if curriculum_score_file and check_score_file(num_samples, curriculum_score_file):
+        with open(curriculum_score_file, 'r') as curriculum_score_file:
+            sample_scores = [int(line.strip()) for line in curriculum_score_file.readlines() if line.strip()]
+
+        # calculate the number of shards needed according to samples_per_shard
+        num_shards = 0
+        count_dict = Counter(sample_scores)
+        for score in count_dict:
+            num_shards += int(math.ceil(count_dict[score]/samples_per_shard))
+
+        # change min_num_shards to the minimal multiple of number of unique curriculum scores
+        min_num_shards = int(math.ceil(min_num_shards/len(count_dict.keys())))*len(count_dict.keys())
+
+        return max(num_shards, min_num_shards, len(count_dict.keys()))
+
     return max(int(math.ceil(num_samples / samples_per_shard)), min_num_shards)
 
 
@@ -542,6 +607,7 @@ def prepare_data(source_fnames: List[str],
                  samples_per_shard: int,
                  min_num_shards: int,
                  output_prefix: str,
+                 curriculum_score_file: str,
                  keep_tmp_shard_files: bool = False):
     logger.info("Preparing data.")
     # write vocabularies to data folder
@@ -552,10 +618,6 @@ def prepare_data(source_fnames: List[str],
     length_statistics = analyze_sequence_lengths(source_fnames, target_fname, source_vocabs, target_vocab,
                                                  max_seq_len_source, max_seq_len_target)
 
-    check_condition(length_statistics.num_sents > 0,
-                    "No training sequences found with length smaller or equal than the maximum sequence length."
-                    "Consider increasing %s" % C.TRAINING_ARG_MAX_SEQ_LEN)
-
     # define buckets
     buckets = define_parallel_buckets(max_seq_len_source, max_seq_len_target, bucket_width,
                                       length_statistics.length_ratio_mean) if bucketing else [
@@ -564,7 +626,7 @@ def prepare_data(source_fnames: List[str],
 
     # Pass 2: Randomly assign data to data shards
     # no pre-processing yet, just write the sentences to different files
-    num_shards = get_num_shards(length_statistics.num_sents, samples_per_shard, min_num_shards)
+    num_shards = get_num_shards(length_statistics.num_sents, samples_per_shard, min_num_shards, curriculum_score_file)
     logger.info("%d samples will be split into %d shard(s) (requested samples/shard=%d, min_num_shards=%d)."
                 % (length_statistics.num_sents, num_shards, samples_per_shard, min_num_shards))
     shards, data_statistics = shard_data(source_fnames=source_fnames,
@@ -575,7 +637,9 @@ def prepare_data(source_fnames: List[str],
                                          buckets=buckets,
                                          length_ratio_mean=length_statistics.length_ratio_mean,
                                          length_ratio_std=length_statistics.length_ratio_std,
-                                         output_prefix=output_prefix)
+                                         output_prefix=output_prefix,
+                                         samples_per_shard=samples_per_shard,
+                                         curriculum_score_file=curriculum_score_file)
     data_statistics.log()
 
     data_loader = RawParallelDatasetLoader(buckets=buckets,
@@ -622,27 +686,19 @@ def prepare_data(source_fnames: List[str],
         version_out.write(str(C.PREPARED_DATA_VERSION))
 
 
-def get_data_statistics(source_readers: Optional[Sequence[Iterable]],
+def get_data_statistics(source_readers: Sequence[Iterable],
                         target_reader: Iterable,
                         buckets: List[Tuple[int, int]],
                         length_ratio_mean: float,
                         length_ratio_std: float,
-                        source_vocabs: Optional[List[vocab.Vocab]],
+                        source_vocabs: List[vocab.Vocab],
                         target_vocab: vocab.Vocab) -> 'DataStatistics':
-    data_stats_accumulator = DataStatisticsAccumulator(buckets,
-                                                       source_vocabs[0] if source_vocabs is not None else None,
-                                                       target_vocab,
-                                                       length_ratio_mean,
-                                                       length_ratio_std)
+    data_stats_accumulator = DataStatisticsAccumulator(buckets, source_vocabs[0], target_vocab,
+                                                       length_ratio_mean, length_ratio_std)
 
-    if source_readers is not None:
-        for sources, target in parallel_iter(source_readers, target_reader):
-            buck_idx, buck = get_parallel_bucket(buckets, len(sources[0]), len(target))
-            data_stats_accumulator.sequence_pair(sources[0], target, buck_idx)
-    else:  # Allow stats for target only data
-        for target in target_reader:
-            buck_idx, buck = get_target_bucket(buckets, len(target))
-            data_stats_accumulator.sequence_pair([], target, buck_idx)
+    for sources, target in parallel_iter(source_readers, target_reader):
+        buck_idx, buck = get_parallel_bucket(buckets, len(sources[0]), len(target))
+        data_stats_accumulator.sequence_pair(sources[0], target, buck_idx)
 
     return data_stats_accumulator.statistics
 
@@ -656,7 +712,8 @@ def get_validation_data_iter(data_loader: RawParallelDatasetLoader,
                              target_vocab: vocab.Vocab,
                              max_seq_len_source: int,
                              max_seq_len_target: int,
-                             batch_size: int) -> 'ParallelSampleIter':
+                             batch_size: int,
+                             fill_up: str) -> 'ParallelSampleIter':
     """
     Returns a ParallelSampleIter for the validation data.
     """
@@ -666,11 +723,6 @@ def get_validation_data_iter(data_loader: RawParallelDatasetLoader,
     validation_length_statistics = analyze_sequence_lengths(validation_sources, validation_target,
                                                             source_vocabs, target_vocab,
                                                             max_seq_len_source, max_seq_len_target)
-
-    check_condition(validation_length_statistics.num_sents > 0,
-                    "No validation sequences found with length smaller or equal than the maximum sequence length."
-                    "Consider increasing %s" % C.TRAINING_ARG_MAX_SEQ_LEN)
-
     validation_sources_sentences, validation_target_sentences = create_sequence_readers(validation_sources,
                                                                                         validation_target,
                                                                                         source_vocabs, target_vocab)
@@ -685,7 +737,8 @@ def get_validation_data_iter(data_loader: RawParallelDatasetLoader,
     validation_data_statistics.log(bucket_batch_sizes)
 
     validation_data = data_loader.load(validation_sources_sentences, validation_target_sentences,
-                                       validation_data_statistics.num_sents_per_bucket).fill_up(bucket_batch_sizes)
+                                       validation_data_statistics.num_sents_per_bucket).fill_up(bucket_batch_sizes,
+                                                                                                fill_up)
 
     return ParallelSampleIter(data=validation_data,
                               buckets=buckets,
@@ -701,9 +754,11 @@ def get_prepared_data_iters(prepared_data_dir: str,
                             batch_size: int,
                             batch_by_words: bool,
                             batch_num_devices: int,
-                            permute: bool = True) -> Tuple['BaseParallelSampleIter',
-                                                           'BaseParallelSampleIter',
-                                                           'DataConfig', List[vocab.Vocab], vocab.Vocab]:
+                            fill_up: str,
+                            curriculum_training: bool,
+                            curriculum_update_freq: int) -> Tuple['BaseParallelSampleIter',
+                                                                  'BaseParallelSampleIter',
+                                                                  'DataConfig', List[vocab.Vocab], vocab.Vocab]:
     logger.info("===============================")
     logger.info("Creating training data iterator")
     logger.info("===============================")
@@ -729,10 +784,9 @@ def get_prepared_data_iters(prepared_data_dir: str,
     for shard_fname in shard_fnames:
         check_condition(os.path.exists(shard_fname), "Shard %s does not exist." % shard_fname)
 
-    check_condition(shared_vocab == data_info.shared_vocab, "Shared vocabulary settings need to match these "
-                                                            "of the prepared data (e.g. for weight tying). "
-                                                            "Specify or omit %s consistently when training "
-                                                            "and preparing the data." % C.VOCAB_ARG_SHARED_VOCAB)
+    check_condition(shared_vocab == data_info.shared_vocab, "Shared config needed (e.g. for weight tying), but "
+                                                            "data was prepared without a shared vocab. Use %s when "
+                                                            "preparing the data." % C.VOCAB_ARG_SHARED_VOCAB)
 
     source_vocabs = vocab.load_source_vocabs(prepared_data_dir)
     target_vocab = vocab.load_target_vocab(prepared_data_dir)
@@ -753,12 +807,35 @@ def get_prepared_data_iters(prepared_data_dir: str,
 
     config_data.data_statistics.log(bucket_batch_sizes)
 
-    train_iter = ShardedParallelSampleIter(shard_fnames,
-                                           buckets,
-                                           batch_size,
-                                           bucket_batch_sizes,
-                                           num_factors=len(data_info.sources),
-                                           permute=permute)
+    if curriculum_training:
+        check_condition(os.path.exists(os.path.join(prepared_data_dir, "shard_scores")),
+                        "Curriculum training was specified but no shard weights were found."
+                        "Run sockeye.prepare_data for curriculum training")
+
+        shards_complexity = []
+        with open(os.path.join(prepared_data_dir, "shard_scores")) as shard_scores_file:
+            for shard_score in shard_scores_file:
+                shards_complexity.append(int(shard_score))
+
+        check_condition(len(shards_complexity) == len(shard_fnames),
+                        "Did not find shard scores for all shards in %s"
+                        % os.path.join(prepared_data_dir, "shard_scores"))
+
+        train_iter = CurriculumParallelSampleIter(shard_fnames,
+                                                  shards_complexity,
+                                                  curriculum_update_freq,
+                                                  buckets,
+                                                  batch_size,
+                                                  bucket_batch_sizes,
+                                                  fill_up,
+                                                  num_factors=len(data_info.sources))
+    else:
+        train_iter = ShardedParallelSampleIter(shard_fnames,
+                                               buckets,
+                                               batch_size,
+                                               bucket_batch_sizes,
+                                               fill_up,
+                                               num_factors=len(data_info.sources))
 
     data_loader = RawParallelDatasetLoader(buckets=buckets,
                                            eos_id=target_vocab[C.EOS_SYMBOL],
@@ -773,7 +850,8 @@ def get_prepared_data_iters(prepared_data_dir: str,
                                                target_vocab=target_vocab,
                                                max_seq_len_source=max_seq_len_source,
                                                max_seq_len_target=max_seq_len_target,
-                                               batch_size=batch_size)
+                                               batch_size=batch_size,
+                                               fill_up=fill_up)
 
     return train_iter, validation_iter, config_data, source_vocabs, target_vocab
 
@@ -790,13 +868,13 @@ def get_training_data_iters(sources: List[str],
                             batch_size: int,
                             batch_by_words: bool,
                             batch_num_devices: int,
+                            fill_up: str,
                             max_seq_len_source: int,
                             max_seq_len_target: int,
                             bucketing: bool,
-                            bucket_width: int,
-                            allow_empty: bool = False) -> Tuple['BaseParallelSampleIter',
-                                                                Optional['BaseParallelSampleIter'],
-                                                                'DataConfig', 'DataInfo']:
+                            bucket_width: int) -> Tuple['BaseParallelSampleIter',
+                                                        'BaseParallelSampleIter',
+                                                        'DataConfig', 'DataInfo']:
     """
     Returns data iterators for training and validation data.
 
@@ -812,11 +890,11 @@ def get_training_data_iters(sources: List[str],
     :param batch_size: Batch size.
     :param batch_by_words: Size batches by words rather than sentences.
     :param batch_num_devices: Number of devices batches will be parallelized across.
+    :param fill_up: Fill-up strategy for buckets.
     :param max_seq_len_source: Maximum source sequence length.
     :param max_seq_len_target: Maximum target sequence length.
     :param bucketing: Whether to use bucketing.
     :param bucket_width: Size of buckets.
-    :param allow_empty: Unless True if no sentences are below or equal to the maximum length an exception is raised.
     :return: Tuple of (training data iterator, validation data iterator, data config).
     """
     logger.info("===============================")
@@ -825,12 +903,6 @@ def get_training_data_iters(sources: List[str],
     # Pass 1: get target/source length ratios.
     length_statistics = analyze_sequence_lengths(sources, target, source_vocabs, target_vocab,
                                                  max_seq_len_source, max_seq_len_target)
-
-    if not allow_empty:
-        check_condition(length_statistics.num_sents > 0,
-                        "No training sequences found with length smaller or equal than the maximum sequence length."
-                        "Consider increasing %s" % C.TRAINING_ARG_MAX_SEQ_LEN)
-
     # define buckets
     buckets = define_parallel_buckets(max_seq_len_source, max_seq_len_target, bucket_width,
                                       length_statistics.length_ratio_mean) if bucketing else [
@@ -838,7 +910,7 @@ def get_training_data_iters(sources: List[str],
 
     sources_sentences, target_sentences = create_sequence_readers(sources, target, source_vocabs, target_vocab)
 
-    # Pass 2: Get data statistics and determine the number of data points for each bucket.
+    # 2. pass: Get data statistics
     data_statistics = get_data_statistics(sources_sentences, target_sentences, buckets,
                                           length_statistics.length_ratio_mean, length_statistics.length_ratio_std,
                                           source_vocabs, target_vocab)
@@ -851,13 +923,13 @@ def get_training_data_iters(sources: List[str],
 
     data_statistics.log(bucket_batch_sizes)
 
-    # Pass 3: Load the data into memory and return the iterator.
     data_loader = RawParallelDatasetLoader(buckets=buckets,
                                            eos_id=target_vocab[C.EOS_SYMBOL],
                                            pad_id=C.PAD_ID)
 
+    # Returns bucketed data
     training_data = data_loader.load(sources_sentences, target_sentences,
-                                     data_statistics.num_sents_per_bucket).fill_up(bucket_batch_sizes)
+                                     data_statistics.num_sents_per_bucket).fill_up(bucket_batch_sizes, fill_up)
 
     data_info = DataInfo(sources=sources,
                          target=target,
@@ -876,8 +948,7 @@ def get_training_data_iters(sources: List[str],
                                     buckets=buckets,
                                     batch_size=batch_size,
                                     bucket_batch_sizes=bucket_batch_sizes,
-                                    num_factors=len(sources),
-                                    permute=True)
+                                    num_factors=len(sources))
 
     validation_iter = get_validation_data_iter(data_loader=data_loader,
                                                validation_sources=validation_sources,
@@ -888,60 +959,10 @@ def get_training_data_iters(sources: List[str],
                                                target_vocab=target_vocab,
                                                max_seq_len_source=max_seq_len_source,
                                                max_seq_len_target=max_seq_len_target,
-                                               batch_size=batch_size)
+                                               batch_size=batch_size,
+                                               fill_up=fill_up)
 
     return train_iter, validation_iter, config_data, data_info
-
-
-def get_scoring_data_iters(sources: List[str],
-                           target: str,
-                           source_vocabs: List[vocab.Vocab],
-                           target_vocab: vocab.Vocab,
-                           batch_size: int,
-                           batch_num_devices: int,
-                           max_seq_len_source: int,
-                           max_seq_len_target: int) -> 'BaseParallelSampleIter':
-    """
-    Returns a data iterator for scoring. The iterator loads data on demand,
-    batch by batch, and does not skip any lines. Lines that are too long
-    are truncated.
-
-    :param sources: Path to source training data (with optional factor data paths).
-    :param target: Path to target training data.
-    :param source_vocabs: Source vocabulary and optional factor vocabularies.
-    :param target_vocab: Target vocabulary.
-    :param batch_size: Batch size.
-    :param batch_num_devices: Number of devices batches will be parallelized across.
-    :param max_seq_len_source: Maximum source sequence length.
-    :param max_seq_len_target: Maximum target sequence length.
-    :return: The scoring data iterator.
-    """
-    logger.info("==============================")
-    logger.info("Creating scoring data iterator")
-    logger.info("==============================")
-
-    # One bucket to hold them all,
-    bucket = (max_seq_len_source, max_seq_len_target)
-
-    # ...One loader to raise them,
-    data_loader = RawParallelDatasetLoader(buckets=[bucket],
-                                           eos_id=target_vocab[C.EOS_SYMBOL],
-                                           pad_id=C.PAD_ID,
-                                           skip_blanks=False)
-
-    # ...one iterator to traverse them all,
-    scoring_iter = BatchedRawParallelSampleIter(data_loader=data_loader,
-                                                sources=sources,
-                                                target=target,
-                                                source_vocabs=source_vocabs,
-                                                target_vocab=target_vocab,
-                                                bucket=bucket,
-                                                batch_size=batch_size,
-                                                max_lens=(max_seq_len_source, max_seq_len_target),
-                                                num_factors=len(sources))
-
-    # and with the model appraise them.
-    return scoring_iter
 
 
 class LengthStatistics(config.Config):
@@ -1090,6 +1111,7 @@ def strids2ids(tokens: Iterable[str]) -> List[int]:
     """
     Returns sequence of integer ids given a sequence of string ids.
 
+
     :param tokens: List of integer tokens.
     :return: List of word ids.
     """
@@ -1103,22 +1125,7 @@ def ids2strids(ids: Iterable[int]) -> str:
     :param ids: Sequence of integers.
     :return: String sequence
     """
-    return C.TOKEN_SEPARATOR.join(map(str, ids))
-
-
-def ids2tokens(token_ids: Iterable[int],
-               vocab_inv: Dict[int, str],
-               exclude_set: Set[int]) -> Iterator[str]:
-    """
-    Transforms a list of token IDs into a list of words, excluding any IDs in `exclude_set`.
-
-    :param token_ids: The list of token IDs.
-    :param vocab_inv: The inverse vocabulary.
-    :param exclude_set: The list of token IDs to exclude.
-    :return: The list of words.
-    """
-    tokens = (vocab_inv[token] for token in token_ids)
-    return (tok for token_id, tok in zip(token_ids, tokens) if token_id not in exclude_set)
+    return " ".join(map(str, ids))
 
 
 class SequenceReader(Iterable):
@@ -1129,7 +1136,7 @@ class SequenceReader(Iterable):
     Empty sequences are yielded as None.
 
     :param path: Path to read data from.
-    :param vocabulary: Optional mapping from strings to integer ids.
+    :param vocab: Optional mapping from strings to integer ids.
     :param add_bos: Whether to add Beginning-Of-Sentence (BOS) symbol.
     :param limit: Read limit.
     """
@@ -1191,86 +1198,30 @@ def create_sequence_readers(sources: List[str], target: str,
     return source_sequence_readers, target_sequence_reader
 
 
-def parallel_iter(source_iterables: Sequence[Iterable[Optional[Any]]],
-                  target_iterable: Iterable[Optional[Any]],
-                  skip_blanks: bool = True):
-    """
-    Creates iterators over parallel iteratables by calling iter() on the iterables
-    and chaining to parallel_iterate(). The purpose of the separation is to allow
-    the caller to save iterator state between calls, if desired.
-
-    :param source_iterables: A list of source iterables.
-    :param target_iterable: A target iterable.
-    :param skip_blanks: Whether to skip empty target lines.
-    :return: Iterators over sources and target.
-    """
-    source_iterators = [iter(s) for s in source_iterables]
-    target_iterator = iter(target_iterable)
-    return parallel_iterate(source_iterators, target_iterator, skip_blanks)
-
-
-def parallel_iterate(source_iterators: Sequence[Iterator[Optional[Any]]],
-                     target_iterator: Iterator[Optional[Any]],
-                     skip_blanks: bool = True):
+def parallel_iter(source_iters: Sequence[Iterable[Optional[Any]]], target_iterable: Iterable[Optional[Any]]):
     """
     Yields parallel source(s), target sequences from iterables.
     Checks for token parallelism in source sequences.
     Skips pairs where element in at least one iterable is None.
     Checks that all iterables have the same number of elements.
-    Can optionally continue from an already-begun iterator.
-
-    :param source_iterators: A list of source iterators.
-    :param target_iterator: A target iterator.
-    :param skip_blanks: Whether to skip empty target lines.
-    :return: Iterators over sources and target.
     """
     num_skipped = 0
-    while True:
-        try:
-            sources = [next(source_iter) for source_iter in source_iterators]
-            target = next(target_iterator)
-        except StopIteration:
-            break
-        if skip_blanks and (any((s is None for s in sources)) or target is None):
+    source_iters = [iter(s) for s in source_iters]
+    target_iter = iter(target_iterable)
+    for sources, target in zip(zip(*source_iters), target_iter):
+        if any((s is None for s in sources)) or target is None:
             num_skipped += 1
             continue
-        check_condition(are_none(sources) or are_token_parallel(sources), "Source sequences are not token-parallel: %s" % (str(sources)))
+        check_condition(are_token_parallel(sources), "Source sequences are not token-parallel: %s" % (str(sources)))
         yield sources, target
 
     if num_skipped > 0:
         logger.warning("Parallel reading of sequences skipped %d elements", num_skipped)
 
     check_condition(
-        all(next(cast(Iterator, s), None) is None for s in source_iterators) and next(cast(Iterator, target_iterator),
-                                                                                      None) is None,
+        all(next(cast(Iterator, s), None) is None for s in source_iters) and next(cast(Iterator, target_iter),
+                                                                                  None) is None,
         "Different number of lines in source(s) and target iterables.")
-
-
-class FileListReader(Iterator):
-    """
-    Reads sequence samples from path provided in a file.
-
-    :param fname: File name containing a list of relative paths.
-    :param path: Path to read data from, which is prefixed to the relative paths of fname.
-    """
-
-    def __init__(self,
-                 fname: str,
-                 path: str) -> None:
-        self.fname = fname
-        self.path = path
-        self.fd = smart_open(fname)
-        self.count = 0
-
-    def __next__(self):
-        fname = self.fd.readline().strip("\n")
-
-        if fname is None:
-            self.fd.close()
-            raise StopIteration
-
-        self.count += 1
-        return os.path.join(self.path, fname)
 
 
 def get_default_bucket_key(buckets: List[Tuple[int, int]]) -> Tuple[int, int]:
@@ -1288,10 +1239,9 @@ def get_parallel_bucket(buckets: List[Tuple[int, int]],
                         length_target: int) -> Tuple[Optional[int], Optional[Tuple[int, int]]]:
     """
     Returns bucket index and bucket from a list of buckets, given source and target length.
-    Algorithm assumes buckets are sorted from shortest to longest.
     Returns (None, None) if no bucket fits.
 
-    :param buckets: List of buckets, in sorted order, shortest to longest.
+    :param buckets: List of buckets.
     :param length_source: Length of source sequence.
     :param length_target: Length of target sequence.
     :return: Tuple of (bucket index, bucket), or (None, None) if not fitting.
@@ -1300,24 +1250,6 @@ def get_parallel_bucket(buckets: List[Tuple[int, int]],
         if source_bkt >= length_source and target_bkt >= length_target:
             return j, (source_bkt, target_bkt)
     return None, None
-
-
-def get_target_bucket(buckets: List[Tuple[int, int]],
-                      length_target: int) -> Optional[Tuple[int, Tuple[int, int]]]:
-    """
-    Returns bucket index and bucket from a list of buckets, given source and target length.
-    Returns (None, None) if no bucket fits.
-
-    :param buckets: List of buckets.
-    :param length_target: Length of target sequence.
-    :return: Tuple of (bucket index, bucket), or (None, None) if not fitting.
-    """
-    bucket = None, None  # type: Tuple[int, Tuple[int, int]]
-    for j, (source_bkt, target_bkt) in enumerate(buckets):
-        if target_bkt >= length_target:
-            bucket = j, (source_bkt, target_bkt)
-            break
-    return bucket
 
 
 class ParallelDataSet(Sized):
@@ -1364,11 +1296,13 @@ class ParallelDataSet(Sized):
 
     def fill_up(self,
                 bucket_batch_sizes: List[BucketBatchSize],
+                fill_up: str,
                 seed: int = 42) -> 'ParallelDataSet':
         """
-        Returns a new dataset with buckets filled up.
+        Returns a new dataset with buckets filled up using the specified fill-up strategy.
 
         :param bucket_batch_sizes: Bucket batch sizes.
+        :param fill_up: Fill-up strategy.
         :param seed: The random seed used for sampling sentences to fill up.
         :return: New dataset with buckets filled up to the next multiple of batch size
         """
@@ -1386,29 +1320,22 @@ class ParallelDataSet(Sized):
             bucket_label = self.label[bucket_idx]
             num_samples = bucket_source.shape[0]
 
-            # Fill up the last batch by randomly sampling from the extant items.
             if num_samples % bucket_batch_size != 0:
-                rest = bucket_batch_size - num_samples % bucket_batch_size
-                desired_indices_np = rs.randint(num_samples, size=rest)
-                desired_indices = mx.nd.array(desired_indices_np)
-
-                if isinstance(source[bucket_idx], np.ndarray):
-                    source[bucket_idx] = np.concatenate((bucket_source, bucket_source.take(desired_indices_np)), axis=0)
+                if fill_up == 'replicate':
+                    rest = bucket_batch_size - num_samples % bucket_batch_size
+                    logger.info("Replicating %d random samples from %d samples in bucket %s "
+                                "to size it to multiple of %d",
+                                rest, num_samples, bucket, bucket_batch_size)
+                    random_indices = mx.nd.array(rs.randint(num_samples, size=rest))
+                    source[bucket_idx] = mx.nd.concat(bucket_source, bucket_source.take(random_indices), dim=0)
+                    target[bucket_idx] = mx.nd.concat(bucket_target, bucket_target.take(random_indices), dim=0)
+                    label[bucket_idx] = mx.nd.concat(bucket_label, bucket_label.take(random_indices), dim=0)
                 else:
-                    source[bucket_idx] = mx.nd.concat(bucket_source, bucket_source.take(desired_indices), dim=0)
-                target[bucket_idx] = mx.nd.concat(bucket_target, bucket_target.take(desired_indices), dim=0)
-                label[bucket_idx] = mx.nd.concat(bucket_label, bucket_label.take(desired_indices), dim=0)
+                    raise NotImplementedError('Unknown fill-up strategy')
 
         return ParallelDataSet(source, target, label)
 
     def permute(self, permutations: List[mx.nd.NDArray]) -> 'ParallelDataSet':
-        """
-        Permutes the data within each bucket. The permutation is received as an argument,
-        allowing the data to be unpermuted (i.e., restored) later on.
-
-        :param permutations: For each bucket, a permutation of the data within that bucket.
-        :return: A new, permuted ParallelDataSet.
-        """
         assert len(self) == len(permutations)
         source = []
         target = []
@@ -1417,10 +1344,7 @@ class ParallelDataSet(Sized):
             num_samples = self.source[buck_idx].shape[0]
             if num_samples:  # not empty bucket
                 permutation = permutations[buck_idx]
-                if isinstance(self.source[buck_idx], np.ndarray):
-                    source.append(self.source[buck_idx].take(np.int64(permutation.asnumpy())))
-                else:
-                    source.append(self.source[buck_idx].take(permutation))
+                source.append(self.source[buck_idx].take(permutation))
                 target.append(self.target[buck_idx].take(permutation))
                 label.append(self.label[buck_idx].take(permutation))
             else:
@@ -1462,8 +1386,6 @@ def get_batch_indices(data: ParallelDataSet,
     Returns a list of index tuples that index into the bucket and the start index inside a bucket given
     the batch size for a bucket. These indices are valid for the given dataset.
 
-    Put another way, this returns the starting points for all batches within the dataset, across all buckets.
-
     :param data: Data to create indices for.
     :param bucket_batch_sizes: Bucket batch sizes.
     :return: List of 2d indices.
@@ -1489,27 +1411,17 @@ class MetaBaseParallelSampleIter(ABC):
 class BaseParallelSampleIter(mx.io.DataIter):
     """
     Base parallel sample iterator.
-
-    :param buckets: The list of buckets.
-    :param bucket_batch_sizes: A list, parallel to `buckets`, containing the number of samples in each bucket.
-    :param source_data_name: The source data name.
-    :param target_data_name: The target data name.
-    :param label_name: The label name.
-    :param num_factors: The number of source factors.
-    :param permute: Randomly shuffle the parallel data.
-    :param dtype: The MXNet data type.
     """
     __metaclass__ = MetaBaseParallelSampleIter
 
     def __init__(self,
-                 buckets: List[Tuple[int, int]],
-                 batch_size: int,
-                 bucket_batch_sizes: List[BucketBatchSize],
-                 source_data_name: str,
-                 target_data_name: str,
-                 label_name: str,
+                 buckets,
+                 batch_size,
+                 bucket_batch_sizes,
+                 source_data_name,
+                 target_data_name,
+                 label_name,
                  num_factors: int = 1,
-                 permute: bool = True,
                  dtype='float32') -> None:
         super().__init__(batch_size=batch_size)
 
@@ -1520,7 +1432,6 @@ class BaseParallelSampleIter(mx.io.DataIter):
         self.target_data_name = target_data_name
         self.label_name = label_name
         self.num_factors = num_factors
-        self.permute = permute
         self.dtype = dtype
 
         # "Staging area" that needs to fit any size batch we're using by total number of elements.
@@ -1567,108 +1478,6 @@ class BaseParallelSampleIter(mx.io.DataIter):
         pass
 
 
-class BatchedRawParallelSampleIter(BaseParallelSampleIter):
-    """
-    Goes through the raw data, loading only one batch at a time into memory.
-    Used by the scorer. Iterates through the data in order, and therefore does
-    not support bucketing.
-    """
-
-    def __init__(self,
-                 data_loader: RawParallelDatasetLoader,
-                 sources: List[str],
-                 target: str,
-                 source_vocabs: List[vocab.Vocab],
-                 target_vocab: vocab.Vocab,
-                 bucket: Tuple[int, int],
-                 batch_size: int,
-                 max_lens: Tuple[int, int],
-                 num_factors: int = 1,
-                 source_data_name=C.SOURCE_NAME,
-                 target_data_name=C.TARGET_NAME,
-                 label_name=C.TARGET_LABEL_NAME,
-                 dtype='float32') -> None:
-        super().__init__(buckets=[bucket], batch_size=batch_size, bucket_batch_sizes=[BucketBatchSize(bucket, batch_size, None)],
-                         source_data_name=source_data_name, target_data_name=target_data_name,
-                         label_name=label_name, num_factors=num_factors, permute=False, dtype=dtype)
-        self.data_loader = data_loader
-        self.sources_sentences, self.target_sentences = create_sequence_readers(sources, target, source_vocabs, target_vocab)
-        self.sources_iters = [iter(s) for s in self.sources_sentences]
-        self.target_iter = iter(self.target_sentences)
-        self.max_len_source, self.max_len_target = max_lens
-        self.next_batch = None
-        self.sentno = 1
-
-    def reset(self):
-        raise Exception('Not supported!')
-
-    def iter_next(self) -> bool:
-        """
-        True if the iterator can return another batch.
-        """
-
-        # Read batch_size lines from the source stream
-        sources_sentences = [[] for x in self.sources_sentences]  # type: List[List[str]]
-        target_sentences = []  # type: List[str]
-        num_read = 0
-        for num_read, (sources, target) in enumerate(parallel_iterate(self.sources_iters, self.target_iter, skip_blanks=False), 1):
-            source_len = 0 if sources[0] is None else len(sources[0])
-            target_len = 0 if target is None else len(target)
-            if source_len > self.max_len_source:
-                logger.info("Trimming source sentence {} ({} -> {})".format(self.sentno + num_read, source_len, self.max_len_source))
-                sources = [source[0:self.max_len_source] for source in sources]
-            if target_len > self.max_len_target:
-                logger.info("Trimming target sentence {} ({} -> {})".format(self.sentno + num_read, target_len, self.max_len_target))
-                target = target[0:self.max_len_target]
-
-            for i, source in enumerate(sources):
-                sources_sentences[i].append(source)
-            target_sentences.append(target)
-            if num_read == self.batch_size:
-                break
-
-        self.sentno += num_read
-
-        if num_read == 0:
-            self.next_batch = None
-            return False
-
-        # The final batch may be underfilled, so mark it
-        num_pad = self.batch_size - num_read
-
-        dataset = self.data_loader.load(sources_sentences,
-                                        target_sentences,
-                                        [num_read]).fill_up(self.bucket_batch_sizes)
-
-        data = [dataset.source[0], dataset.target[0]]
-        label = dataset.label
-
-        provide_data = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
-                        zip(self.data_names, data)]
-        provide_label = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
-                         zip(self.label_names, label)]
-
-        self.next_batch = mx.io.DataBatch(data, label,
-                                          pad=num_pad, index=None, bucket_key=self.buckets[0],
-                                          provide_data=provide_data, provide_label=provide_label)
-
-        return True
-
-    def next(self) -> mx.io.DataBatch:
-        """
-        Returns the next batch.
-        """
-        if self.iter_next():
-            return self.next_batch
-        raise StopIteration
-
-    def save_state(self, fname: str):
-        raise Exception('Not supported!')
-
-    def load_state(self, fname: str):
-        raise Exception('Not supported!')
-
-
 class ShardedParallelSampleIter(BaseParallelSampleIter):
     """
     Goes through the data one shard at a time. The memory consumption is limited by the memory consumption of the
@@ -1680,18 +1489,19 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
                  buckets,
                  batch_size,
                  bucket_batch_sizes,
+                 fill_up: str,
                  source_data_name=C.SOURCE_NAME,
                  target_data_name=C.TARGET_NAME,
                  label_name=C.TARGET_LABEL_NAME,
                  num_factors: int = 1,
-                 permute: bool = True,
                  dtype='float32') -> None:
         super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
                          source_data_name=source_data_name, target_data_name=target_data_name,
-                         label_name=label_name, num_factors=num_factors, permute=permute, dtype=dtype)
+                         label_name=label_name, num_factors=num_factors, dtype=dtype)
         assert len(shards_fnames) > 0
         self.shards_fnames = list(shards_fnames)
         self.shard_index = -1
+        self.fill_up = fill_up
 
         self.reset()
 
@@ -1699,6 +1509,7 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
         shard_fname = self.shards_fnames[self.shard_index]
         logger.info("Loading shard %s.", shard_fname)
         dataset = ParallelDataSet.load(self.shards_fnames[self.shard_index]).fill_up(self.bucket_batch_sizes,
+                                                                                     self.fill_up,
                                                                                      seed=self.shard_index)
         self.shard_iter = ParallelSampleIter(data=dataset,
                                              buckets=self.buckets,
@@ -1706,8 +1517,7 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
                                              bucket_batch_sizes=self.bucket_batch_sizes,
                                              source_data_name=self.source_data_name,
                                              target_data_name=self.target_data_name,
-                                             num_factors=self.num_factors,
-                                             permute=self.permute)
+                                             num_factors=self.num_factors)
 
     def reset(self):
         if len(self.shards_fnames) > 1:
@@ -1760,6 +1570,141 @@ class ShardedParallelSampleIter(BaseParallelSampleIter):
         self.shard_iter.load_state(fname + ".sharditer")
 
 
+class CurriculumParallelSampleIter(BaseParallelSampleIter):
+    """
+    Goes through the data one shard at a time. The memory consumption is limited by the memory consumption of the
+    largest shard. The order in which shards are traversed is changed with each reset.
+    """
+
+    def __init__(self,
+                 shards_fnames: List[str],
+                 shards_complexity: List[int],
+                 curriculum_update_freq: int,
+                 buckets,
+                 batch_size,
+                 bucket_batch_sizes,
+                 fill_up: str,
+                 source_data_name=C.SOURCE_NAME,
+                 target_data_name=C.TARGET_NAME,
+                 label_name=C.TARGET_LABEL_NAME,
+                 num_factors: int = 1,
+                 dtype='float32') -> None:
+        super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
+                         source_data_name=source_data_name, target_data_name=target_data_name,
+                         label_name=label_name, num_factors=num_factors, dtype=dtype)
+        assert len(shards_fnames) > 0
+        self.max_shard_complexity = 0
+        self.update_max_shard_complexity = False
+        self.shards_fnames = list(shards_fnames)
+        self.shards_complexity = list(shards_complexity)
+        self.visible_shards_fnames = []
+        self.shard_index = -1
+        self.updates_processed = 0
+        self.curriculum_update_freq = curriculum_update_freq
+        self.fill_up = fill_up
+
+        self.reset()
+
+    def _load_shard(self):
+        shard_fname = self.visible_shards_fnames[self.shard_index]
+        logger.info("Loading shard %s.", shard_fname)
+        dataset = ParallelDataSet.load(self.visible_shards_fnames[self.shard_index]).fill_up(self.bucket_batch_sizes,
+                                                                                             self.fill_up,
+                                                                                             seed=self.shard_index)
+        self.shard_iter = ParallelSampleIter(data=dataset,
+                                             buckets=self.buckets,
+                                             batch_size=self.batch_size,
+                                             bucket_batch_sizes=self.bucket_batch_sizes,
+                                             source_data_name=self.source_data_name,
+                                             target_data_name=self.target_data_name,
+                                                 num_factors=self.num_factors)
+
+    def reset(self):
+        # At each reset, given the complexity we are allowed, only a certain number of shards are visible
+        if self.update_max_shard_complexity:
+            logger.info("** Updating complexity constraint (increased by 1)")
+            logger.info("**** Old max complexity " + str(self.max_shard_complexity))
+            self.max_shard_complexity += 1
+            logger.info("**** New max complexity " + str(self.max_shard_complexity))
+            self.update_max_shard_complexity = False
+        self.visible_shards_fnames = [self.shards_fnames[idx] for idx in range(len(self.shards_fnames))
+                                      if self.shards_complexity[idx] <= self.max_shard_complexity]
+        logger.info("Shards visible based on complexity constraint are: " + ','.join(self.visible_shards_fnames))
+        if len(self.visible_shards_fnames) > 1:
+            logger.info("Shuffling the visible shards.")
+            # Making sure to not repeat a shard:
+            # Explicitly, this makes sure that if we last saw shard 5, we will not see it again in the
+            # next epoch as the first shard. That is, the following case is avoided
+            # Epoch 1 : [3, 2, 1, 0]
+            # Epoch 2 : [0, 3, 2, 1]
+            if self.shard_index < 0:
+                current_shard_fname = ""
+            else:
+                current_shard_fname = self.visible_shards_fnames[self.shard_index]
+            remaining_shards = [shard for shard in self.visible_shards_fnames if shard != current_shard_fname]
+            next_shard_fname = random.choice(remaining_shards)
+            remaining_shards = [shard for shard in self.visible_shards_fnames if shard != next_shard_fname]
+            random.shuffle(remaining_shards)
+
+            self.visible_shards_fnames = [next_shard_fname] + remaining_shards
+
+            self.shard_index = 0
+            self._load_shard()
+        else:
+            if self.shard_index < 0:
+                self.shard_index = 0
+                self._load_shard()
+            # We can just reset the shard_iter as we only have a single shard
+            self.shard_iter.reset()
+
+    def iter_next(self) -> bool:
+        next_shard_index = self.shard_index + 1
+        if self.shard_iter.iter_next() or next_shard_index < len(self.visible_shards_fnames):
+            return True
+        return False
+
+    def next(self) -> mx.io.DataBatch:
+        if not self.shard_iter.iter_next():
+            if self.shard_index < len(self.visible_shards_fnames) - 1:
+                self.shard_index += 1
+                self._load_shard()
+            else:
+                raise StopIteration
+        self.updates_processed += 1
+        # Increase complexity allowed (based on update freq)
+        # Defaults to checkpoint freq
+        if self.updates_processed > 0 and self.updates_processed % self.curriculum_update_freq == 0:
+            self.update_max_shard_complexity = True
+        return self.shard_iter.next()
+
+    def save_state(self, fname: str):
+        with open(fname, "wb") as fp:
+            pickle.dump(self.shards_fnames, fp)
+            pickle.dump(self.shard_index, fp)
+
+            # Custom variables for curriculum training
+            pickle.dump(self.max_shard_complexity, fp)
+            pickle.dump(self.update_max_shard_complexity, fp)
+            pickle.dump(self.shards_complexity, fp)
+            pickle.dump(self.visible_shards_fnames, fp)
+            pickle.dump(self.updates_processed, fp)
+
+        self.shard_iter.save_state(fname + ".sharditer")
+
+    def load_state(self, fname: str):
+        with open(fname, "rb") as fp:
+            self.shards_fnames = pickle.load(fp)
+            self.shard_index = pickle.load(fp)
+            # Custom variables for curriculum training
+            self.max_shard_complexity = pickle.load(fp)
+            self.update_max_shard_complexity = pickle.load(fp)
+            self.shards_complexity = pickle.load(fp)
+            self.visible_shards_fnames = pickle.load(fp)
+            self.updates_processed = pickle.load(fp)
+        self._load_shard()
+        self.shard_iter.load_state(fname + ".sharditer")
+
+
 class ParallelSampleIter(BaseParallelSampleIter):
     """
     Data iterator on a bucketed ParallelDataSet. Shuffles data at every reset and supports saving and loading the
@@ -1775,21 +1720,18 @@ class ParallelSampleIter(BaseParallelSampleIter):
                  target_data_name=C.TARGET_NAME,
                  label_name=C.TARGET_LABEL_NAME,
                  num_factors: int = 1,
-                 permute: bool = True,
                  dtype='float32') -> None:
         super().__init__(buckets=buckets, batch_size=batch_size, bucket_batch_sizes=bucket_batch_sizes,
                          source_data_name=source_data_name, target_data_name=target_data_name,
-                         label_name=label_name, num_factors=num_factors, permute=permute, dtype=dtype)
+                         label_name=label_name, num_factors=num_factors, dtype=dtype)
 
         # create independent lists to be shuffled
         self.data = ParallelDataSet(list(data.source), list(data.target), list(data.label))
 
-        # create index tuples (buck_idx, batch_start_pos) into buckets.
-        # This is the list of all batches across all buckets in the dataset. These will be shuffled.
+        # create index tuples (buck_idx, batch_start_pos) into buckets. These will be shuffled.
         self.batch_indices = get_batch_indices(self.data, bucket_batch_sizes)
         self.curr_batch_index = 0
 
-        # Produces a permutation of the batches within each bucket, along with the permutation that inverts it.
         self.inverse_data_permutations = [mx.nd.arange(0, max(1, self.data.source[i].shape[0]))
                                           for i in range(len(self.data))]
         self.data_permutations = [mx.nd.arange(0, max(1, self.data.source[i].shape[0]))
@@ -1802,16 +1744,15 @@ class ParallelSampleIter(BaseParallelSampleIter):
         Resets and reshuffles the data.
         """
         self.curr_batch_index = 0
-        if self.permute:
-            # shuffle batch start indices
-            random.shuffle(self.batch_indices)
+        # shuffle batch start indices
+        random.shuffle(self.batch_indices)
 
-            # restore the data permutation
-            self.data = self.data.permute(self.inverse_data_permutations)
+        # restore
+        self.data = self.data.permute(self.inverse_data_permutations)
 
-            # permute the data within each batch
-            self.data_permutations, self.inverse_data_permutations = get_permutations(self.data.get_bucket_counts())
-            self.data = self.data.permute(self.data_permutations)
+        self.data_permutations, self.inverse_data_permutations = get_permutations(self.data.get_bucket_counts())
+
+        self.data = self.data.permute(self.data_permutations)
 
     def iter_next(self) -> bool:
         """
@@ -1840,7 +1781,7 @@ class ParallelSampleIter(BaseParallelSampleIter):
         provide_label = [mx.io.DataDesc(name=n, shape=x.shape, layout=C.BATCH_MAJOR) for n, x in
                          zip(self.label_names, label)]
 
-        # TODO: num pad examples is not set here if fillup policy would be padding
+        # TODO: num pad examples is not set here if fillup strategy would be padding
         return mx.io.DataBatch(data, label,
                                pad=0, index=None, bucket_key=self.buckets[i],
                                provide_data=provide_data, provide_label=provide_label)

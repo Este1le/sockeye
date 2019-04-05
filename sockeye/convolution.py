@@ -177,3 +177,4 @@ class ConvolutionBlock:
         # (batch_size, seq_len, num_hidden)
         block_output = mx.sym.swapaxes(block_output, dim1=1, dim2=2)
         return block_output
+

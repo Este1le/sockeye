@@ -17,7 +17,6 @@ Command-line tool to inspect model embeddings.
 import argparse
 import os
 import sys
-import logging
 from typing import Iterable, Tuple
 
 import mxnet as mx
@@ -31,7 +30,7 @@ from .log import setup_main_logger
 from .utils import check_condition
 from .vocab import load_source_vocabs, load_target_vocab, reverse_vocab
 
-logger = logging.getLogger(__name__)
+logger = setup_main_logger(__name__, file_logging=False)
 
 
 def compute_sims(inputs: mx.nd.NDArray, normalize: bool) -> mx.nd.NDArray:
@@ -85,7 +84,6 @@ def main():
     """
     Command-line tool to inspect model embeddings.
     """
-    setup_main_logger(file_logging=False)
     params = argparse.ArgumentParser(description='Shows nearest neighbours of input tokens in the embedding space.')
     params.add_argument('--model', '-m', required=True,
                         help='Model folder to load config from.')

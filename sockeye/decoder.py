@@ -220,6 +220,7 @@ class TransformerDecoder(Decoder):
         self.layers = [transformer.TransformerDecoderBlock(
             config, prefix="%s%d_" % (prefix, i)) for i in range(config.num_layers)]
         self.final_process = transformer.TransformerProcessBlock(sequence=config.preprocess_sequence,
+                                                                 num_hidden=config.model_size,
                                                                  dropout=config.dropout_prepost,
                                                                  prefix="%sfinal_process_" % prefix)
 
@@ -453,8 +454,6 @@ class RecurrentDecoderConfig(Config):
     :param context_gating: Whether to use context gating.
     :param layer_normalization: Apply layer normalization.
     :param attention_in_upper_layers: Pass the attention value to all layers in the decoder.
-    :param enc_last_hidden_concat_to_embedding: Concatenate the last hidden representation of the encoder to the
-                                                input of the decoder (e.g., context + current embedding).
     :param dtype: Data type.
     """
 
@@ -462,15 +461,13 @@ class RecurrentDecoderConfig(Config):
                  max_seq_len_source: int,
                  rnn_config: rnn.RNNConfig,
                  attention_config: rnn_attention.AttentionConfig,
-                 hidden_dropout: float = .0,
+                 hidden_dropout: float = .0,  # TODO: move this dropout functionality to OutputLayer
                  state_init: str = C.RNN_DEC_INIT_LAST,
                  state_init_lhuc: bool = False,
                  context_gating: bool = False,
                  layer_normalization: bool = False,
                  attention_in_upper_layers: bool = False,
-                 dtype: str = C.DTYPE_FP32,
-                 enc_last_hidden_concat_to_embedding: bool = False) -> None:
-
+                 dtype: str = C.DTYPE_FP32) -> None:
         super().__init__()
         self.max_seq_len_source = max_seq_len_source
         self.rnn_config = rnn_config
@@ -481,7 +478,6 @@ class RecurrentDecoderConfig(Config):
         self.context_gating = context_gating
         self.layer_normalization = layer_normalization
         self.attention_in_upper_layers = attention_in_upper_layers
-        self.enc_last_hidden_concat_to_embedding = enc_last_hidden_concat_to_embedding
         self.dtype = dtype
 
 
@@ -540,9 +536,9 @@ class RecurrentDecoder(Decoder):
         # Hidden state parameters
         self.hidden_w = mx.sym.Variable("%shidden_weight" % prefix)
         self.hidden_b = mx.sym.Variable("%shidden_bias" % prefix)
-        self.hidden_norm = None
-        if self.config.layer_normalization:
-            self.hidden_norm = layers.LayerNormalization(prefix="%shidden_norm" % prefix)
+        self.hidden_norm = layers.LayerNormalization(self.num_hidden,
+                                                     prefix="%shidden_norm" % prefix) \
+            if self.config.layer_normalization else None
 
     def _create_state_init_parameters(self):
         """
@@ -557,8 +553,9 @@ class RecurrentDecoder(Decoder):
             self.init_ws.append(mx.sym.Variable("%senc2decinit_%d_weight" % (self.prefix, state_idx)))
             self.init_bs.append(mx.sym.Variable("%senc2decinit_%d_bias" % (self.prefix, state_idx)))
             if self.config.layer_normalization:
-                self.init_norms.append(layers.LayerNormalization(prefix="%senc2decinit_%d_norm" % (self.prefix,
-                                                                                                   state_idx)))
+                self.init_norms.append(layers.LayerNormalization(num_hidden=init_num_hidden,
+                                                                 prefix="%senc2decinit_%d_norm" % (
+                                                                     self.prefix, state_idx)))
 
     def decode_sequence(self,
                         source_encoded: mx.sym.Symbol,
@@ -583,14 +580,6 @@ class RecurrentDecoder(Decoder):
         # target_embed: target_seq_len * (batch_size, num_target_embed)
         target_embed = mx.sym.split(data=target_embed, num_outputs=target_embed_max_length, axis=1, squeeze_axis=True)
 
-        # Get last state from source (batch_size, num_target_embed)
-        enc_last_hidden = None
-        if self.config.enc_last_hidden_concat_to_embedding:
-            enc_last_hidden = mx.sym.SequenceLast(data=source_encoded,
-                                                  sequence_length=source_encoded_lengths,
-                                                  axis=1,
-                                                  use_sequence_length=True)
-
         # get recurrent attention function conditioned on source
         attention_func = self.attention.on(source_encoded, source_encoded_lengths,
                                            source_encoded_max_length)
@@ -611,8 +600,7 @@ class RecurrentDecoder(Decoder):
                                                 state,
                                                 attention_func,
                                                 attention_state,
-                                                seq_idx,
-                                                enc_last_hidden=enc_last_hidden)
+                                                seq_idx)
             hidden_states.append(state.hidden)
 
         # concatenate along time axis: (batch_size, target_embed_max_length, rnn_num_hidden)
@@ -637,14 +625,6 @@ class RecurrentDecoder(Decoder):
         """
         source_encoded, prev_dynamic_source, source_encoded_length, prev_hidden, *layer_states = states
 
-        # Get last state from source (batch_size, num_target_embed)
-        enc_last_hidden = None
-        if self.config.enc_last_hidden_concat_to_embedding:
-            enc_last_hidden = mx.sym.SequenceLast(data=source_encoded,
-                                                  sequence_length=source_encoded_length,
-                                                  axis=1,
-                                                  use_sequence_length=True)
-
         attention_func = self.attention.on(source_encoded, source_encoded_length, source_encoded_max_length)
 
         prev_state = RecurrentDecoderState(prev_hidden, list(layer_states))
@@ -657,8 +637,7 @@ class RecurrentDecoder(Decoder):
         state, attention_state = self._step(target_embed_prev,
                                             prev_state,
                                             attention_func,
-                                            prev_attention_state,
-                                            enc_last_hidden=enc_last_hidden)
+                                            prev_attention_state)
 
         new_states = [source_encoded,
                       attention_state.dynamic_source,
@@ -817,12 +796,12 @@ class RecurrentDecoder(Decoder):
                                              bias=self.init_bs[state_idx],
                                              name="%senc2decinit_%d" % (self.prefix, state_idx))
                 if self.config.layer_normalization:
-                    init = self.init_norms[state_idx](data=init)
+                    init = self.init_norms[state_idx].normalize(init)
                 init = mx.sym.Activation(data=init, act_type="tanh",
                                          name="%senc2dec_inittanh_%d" % (self.prefix, state_idx))
                 if self.config.state_init_lhuc:
                     lhuc = layers.LHUC(init_num_hidden, prefix="%senc2decinit_%d_" % (self.prefix, state_idx))
-                    init = lhuc(init)
+                    init = lhuc.apply(init)
             layer_states.append(init)
 
         return RecurrentDecoderState(hidden, layer_states)
@@ -831,8 +810,7 @@ class RecurrentDecoder(Decoder):
               state: RecurrentDecoderState,
               attention_func: Callable,
               attention_state: rnn_attention.AttentionState,
-              seq_idx: int = 0,
-              enc_last_hidden: Optional[mx.sym.Symbol] = None) -> Tuple[RecurrentDecoderState, rnn_attention.AttentionState]:
+              seq_idx: int = 0) -> Tuple[RecurrentDecoderState, rnn_attention.AttentionState]:
 
         """
         Performs single-time step in the RNN, given previous word vector, previous hidden state, attention function,
@@ -847,13 +825,10 @@ class RecurrentDecoder(Decoder):
         """
         # (1) RNN step
         # concat previous word embedding and previous hidden state
-        if enc_last_hidden is not None:
-            word_vec_prev = mx.sym.concat(word_vec_prev, enc_last_hidden, dim=1,
-                                          name="%sconcat_target_encoder_t%d" % (self.prefix, seq_idx))
         rnn_input = mx.sym.concat(word_vec_prev, state.hidden, dim=1,
                                   name="%sconcat_target_context_t%d" % (self.prefix, seq_idx))
         # rnn_pre_attention_output: (batch_size, rnn_num_hidden)
-        # rnn_pre_attention_layer_states: num_layers * [batch_size, rnn_num_hidden]
+        # next_layer_states: num_layers * [batch_size, rnn_num_hidden]
         rnn_pre_attention_output, rnn_pre_attention_layer_states = \
             self.rnn_pre_attention(rnn_input, state.layer_states[:self.rnn_pre_attention_n_states])
 
@@ -895,7 +870,7 @@ class RecurrentDecoder(Decoder):
                                        bias=self.hidden_b,
                                        name='%shidden_fc_t%d' % (self.prefix, seq_idx))
         if self.config.layer_normalization:
-            hidden = self.hidden_norm(data=hidden)
+            hidden = self.hidden_norm.normalize(hidden)
 
         # hidden: (batch_size, rnn_num_hidden)
         hidden = mx.sym.Activation(data=hidden, act_type="tanh",
@@ -929,7 +904,7 @@ class RecurrentDecoder(Decoder):
         hidden = gate * mapped_rnn_output + (1 - gate) * mapped_context
 
         if self.config.layer_normalization:
-            hidden = self.hidden_norm(data=hidden)
+            hidden = self.hidden_norm.normalize(hidden)
 
         # hidden: (batch_size, rnn_num_hidden)
         hidden = mx.sym.Activation(data=hidden, act_type="tanh",

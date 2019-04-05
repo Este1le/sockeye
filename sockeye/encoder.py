@@ -32,9 +32,6 @@ from . import utils
 logger = logging.getLogger(__name__)
 
 
-ImageEncoderConfig = None
-
-
 def get_encoder(config: 'EncoderConfig', prefix: str = '') -> 'Encoder':
     if isinstance(config, RecurrentEncoderConfig):
         return get_recurrent_encoder(config, prefix)
@@ -42,16 +39,8 @@ def get_encoder(config: 'EncoderConfig', prefix: str = '') -> 'Encoder':
         return get_transformer_encoder(config, prefix)
     elif isinstance(config, ConvolutionalEncoderConfig):
         return get_convolutional_encoder(config, prefix)
-    elif isinstance(config, EmptyEncoderConfig):
-        return EncoderSequence([EmptyEncoder(config)], config.dtype)
     else:
-        from .image_captioning.encoder import ImageLoadedCnnEncoderConfig, \
-            get_image_cnn_encoder
-
-        if isinstance(config, ImageLoadedCnnEncoderConfig):
-            return get_image_cnn_encoder(config)
-        else:
-            raise ValueError("Unsupported encoder configuration")
+        raise ValueError("Unsupported encoder configuration")
 
 
 class RecurrentEncoderConfig(config.Config):
@@ -100,25 +89,6 @@ class ConvolutionalEncoderConfig(config.Config):
         self.max_seq_len_source = max_seq_len_source
         self.positional_embedding_type = positional_embedding_type
         self.dtype = dtype
-
-
-class EmptyEncoderConfig(config.Config):
-    """
-    Empty encoder configuration.
-    :param num_embed: source embedding size.
-    :param num_hidden: the representation size of this encoder.
-    :param dtype: Data type.
-    """
-
-    def __init__(self,
-                 num_embed: int,
-                 num_hidden: int,
-                 dtype: str = C.DTYPE_FP32) -> None:
-        super().__init__()
-        self.num_embed = num_embed
-        self.num_hidden = num_hidden
-        self.dtype = dtype
-        self.allow_missing = True
 
 
 def get_recurrent_encoder(config: RecurrentEncoderConfig, prefix: str) -> 'Encoder':
@@ -338,7 +308,6 @@ class EmbeddingConfig(config.Config):
                  num_embed: int,
                  dropout: float,
                  factor_configs: Optional[List[FactorConfig]] = None,
-                 source_factors_combine: str = C.SOURCE_FACTORS_COMBINE_CONCAT,
                  dtype: str = C.DTYPE_FP32) -> None:
         super().__init__()
         self.vocab_size = vocab_size
@@ -348,7 +317,6 @@ class EmbeddingConfig(config.Config):
         self.num_factors = 1
         if self.factor_configs is not None:
             self.num_factors += len(self.factor_configs)
-        self.source_factors_combine = source_factors_combine
         self.dtype = dtype
 
 
@@ -379,7 +347,7 @@ class Embedding(Encoder):
 
         self.embed_factor_weights = []  # type: List[mx.sym.Symbol]
         if self.config.factor_configs is not None:
-            # Factor weights aren't shared so they're not passed in and we create them here.
+            # Factors weights aren't shared so they're not passed in and we create them here.
             for i, fc in enumerate(self.config.factor_configs):
                 self.embed_factor_weights.append(mx.sym.Variable(prefix + "factor%d_weight" % i,
                                                                  shape=(fc.vocab_size, fc.num_embed)))
@@ -420,10 +388,7 @@ class Embedding(Encoder):
                                      name=self.prefix + "embed")
 
         if self.config.factor_configs is not None:
-            if self.config.source_factors_combine == C.SOURCE_FACTORS_COMBINE_CONCAT:
-                embedding = mx.sym.concat(embedding, *factor_embeddings, dim=2, name=self.prefix + "embed_plus_factors")
-            else:
-                embedding = mx.sym.add_n(embedding, *factor_embeddings, name=self.prefix + "embed_plus_factors")
+            embedding = mx.sym.concat(embedding, *factor_embeddings, dim=2, name=self.prefix + "embed_plus_factors")
 
         if self.config.dropout > 0:
             embedding = mx.sym.Dropout(data=embedding, p=self.config.dropout, name="source_embed_dropout")
@@ -435,44 +400,6 @@ class Embedding(Encoder):
         Return the representation size of this encoder.
         """
         return self.config.num_embed
-
-
-class PassThroughEmbeddingConfig(EmbeddingConfig):
-
-    def __init__(self) -> None:
-        super().__init__(vocab_size=0, num_embed=0, dropout=0.0, factor_configs=None)
-
-
-class PassThroughEmbedding(Encoder):
-    """
-    This is an embedding which passes through an input symbol without doing any operation.
-
-    :param config: PassThroughEmbeddingConfig config.
-    """
-
-    def __init__(self,
-                 config: PassThroughEmbeddingConfig) -> None:
-        super().__init__('float32')
-        self.config = config
-
-    def encode(self,
-               data: mx.sym.Symbol,
-               data_length: Optional[mx.sym.Symbol],
-               seq_len: int = 0) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
-        """
-        Encodes data given sequence lengths of individual examples and maximum sequence length.
-
-        :param data: Input data.
-        :param data_length: Vector with sequence lengths.
-        :return: Encoded versions of input data (data, data_length, seq_len).
-        """
-        return data, data_length, seq_len
-
-    def get_num_hidden(self) -> int:
-        """
-        Return the representation size of this encoder.
-        """
-        return 0
 
 
 class PositionalEncoder(Encoder):
@@ -784,40 +711,6 @@ class EncoderSequence(Encoder):
         return encoder
 
 
-class EmptyEncoder(Encoder):
-    """
-    This encoder ignores the input data and simply returns zero-filled states in the expected shape.
-    :param config: configuration.
-    """
-
-    def __init__(self,
-                 config: EmptyEncoderConfig) -> None:
-        super().__init__(config.dtype)
-        self.num_embed = config.num_embed
-        self.num_hidden = config.num_hidden
-
-    def encode(self,
-               data: mx.sym.Symbol,
-               data_length: Optional[mx.sym.Symbol],
-               seq_len: int) -> Tuple[mx.sym.Symbol, mx.sym.Symbol, int]:
-        """
-        Encodes data given sequence lengths of individual examples and maximum sequence length.
-        :param data: Input data.
-        :param data_length: Vector with sequence lengths.
-        :param seq_len: Maximum sequence length.
-        :return: Expected number of empty states (zero-filled).
-        """
-        # outputs: (batch_size, seq_len, num_hidden)
-        outputs = mx.sym.dot(data, mx.sym.zeros((self.num_embed, self.num_hidden)))
-        return outputs, data_length, seq_len
-
-    def get_num_hidden(self):
-        """
-        Return the representation size of this encoder.
-        """
-        return self.num_hidden
-
-
 class RecurrentEncoder(Encoder):
     """
     Uni-directional (multi-layered) recurrent encoder.
@@ -1023,6 +916,7 @@ class TransformerEncoder(Encoder):
         self.layers = [transformer.TransformerEncoderBlock(
             config, prefix="%s%d_" % (prefix, i)) for i in range(config.num_layers)]
         self.final_process = transformer.TransformerProcessBlock(sequence=config.preprocess_sequence,
+                                                                 num_hidden=config.model_size,
                                                                  dropout=config.dropout_prepost,
                                                                  prefix="%sfinal_process_" % prefix)
 
@@ -1248,8 +1142,8 @@ class ConvolutionalEmbeddingEncoder(Encoder):
                 transform = mx.sym.Dropout(data=transform, p=self.dropout)
             # Connection
             seg_embedding = gate * transform + (1 - gate) * seg_embedding
-        # (batch_size, seq_len/stride, output_dim) aka
-        # (batch_size, encoded_seq_len, num_segment_embed)
+        # (batch_size, seq_len/stride, outut_dim) aka
+        # (batch_size, encoded_seq_len, num_segment_emded)
         seg_embedding = mx.sym.Reshape(data=seg_embedding,
                                        shape=(-1, encoded_seq_len, self.output_dim))
 
@@ -1277,7 +1171,4 @@ class ConvolutionalEmbeddingEncoder(Encoder):
         return int(ceil(seq_len / self.pool_stride))
 
 
-EncoderConfig = Union[RecurrentEncoderConfig, transformer.TransformerConfig, ConvolutionalEncoderConfig,
-                      EmptyEncoderConfig]
-if ImageEncoderConfig is not None:
-    EncoderConfig = Union[EncoderConfig, ImageEncoderConfig]  # type: ignore
+EncoderConfig = Union[RecurrentEncoderConfig, transformer.TransformerConfig, ConvolutionalEncoderConfig]
