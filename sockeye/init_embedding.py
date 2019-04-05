@@ -58,7 +58,6 @@ Optional arguments:
 
 import argparse
 import sys
-import logging
 from typing import Dict
 
 import numpy as np
@@ -69,7 +68,7 @@ from . import arguments
 from . import utils
 from . import vocab
 
-logger = logging.getLogger(__name__)
+logger = setup_main_logger(__name__, console=True, file_logging=False)
 
 
 def init_weight(weight: np.ndarray,
@@ -124,7 +123,6 @@ def main():
     """
     Commandline interface to initialize Sockeye embedding weights with pretrained word representations.
     """
-    setup_main_logger(console=True, file_logging=False)
     params = argparse.ArgumentParser(description='Quick usage: python3 -m sockeye.init_embedding '
                                                  '-w embed-in-src.npy embed-in-tgt.npy '
                                                  '-i vocab-in-src.json vocab-in-tgt.json '
