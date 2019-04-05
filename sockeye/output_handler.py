@@ -1,4 +1,4 @@
-# Copyright 2017 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# Copyright 2017--2019 Amazon.com, Inc. or its affiliates. All Rights Reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"). You may not
 # use this file except in compliance with the License. A copy of the License
@@ -11,19 +11,20 @@
 # express or implied. See the License for the specific language governing
 # permissions and limitations under the License.
 
-from abc import ABC, abstractmethod
+import json
 import sys
+from abc import ABC, abstractmethod
 from typing import Optional
 
 import sockeye.constants as C
-import sockeye.data_io
-import sockeye.inference
+from . import data_io
+from . import inference
 from sockeye.utils import plot_attention, print_attention_text, get_alignments
 
 
 def get_output_handler(output_type: str,
-                       output_fname: Optional[str],
-                       sure_align_threshold: float) -> 'OutputHandler':
+                       output_fname: Optional[str] = None,
+                       sure_align_threshold: float = 1.0) -> 'OutputHandler':
     """
 
     :param output_type: Type of output handler.
@@ -32,9 +33,15 @@ def get_output_handler(output_type: str,
     :raises: ValueError for unknown output_type.
     :return: Output handler.
     """
-    output_stream = sys.stdout if output_fname is None else sockeye.data_io.smart_open(output_fname, mode='w')
+    output_stream = sys.stdout if output_fname is None else data_io.smart_open(output_fname, mode='w')
     if output_type == C.OUTPUT_HANDLER_TRANSLATION:
         return StringOutputHandler(output_stream)
+    elif output_type == C.OUTPUT_HANDLER_SCORE:
+        return ScoreOutputHandler(output_stream)
+    elif output_type == C.OUTPUT_HANDLER_PAIR_WITH_SCORE:
+        return PairWithScoreOutputHandler(output_stream)
+    elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_SCORE:
+        return StringWithScoreOutputHandler(output_stream)
     elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_ALIGNMENTS:
         return StringWithAlignmentsOutputHandler(output_stream, sure_align_threshold)
     elif output_type == C.OUTPUT_HANDLER_TRANSLATION_WITH_ALIGNMENT_MATRIX:
@@ -45,6 +52,10 @@ def get_output_handler(output_type: str,
         return AlignPlotHandler(plot_prefix="align" if output_fname is None else output_fname)
     elif output_type == C.OUTPUT_HANDLER_ALIGN_TEXT:
         return AlignTextHandler(sure_align_threshold)
+    elif output_type == C.OUTPUT_HANDLER_BEAM_STORE:
+        return BeamStoringHandler(output_stream)
+    elif output_type == C.OUTPUT_HANDLER_JSON:
+        return JSONOutputHandler(output_stream, sure_align_threshold)
     else:
         raise ValueError("unknown output type")
 
@@ -56,13 +67,21 @@ class OutputHandler(ABC):
 
     @abstractmethod
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
         :param t_output: Translator output.
         :param t_walltime: Total wall-clock time for translation.
+        """
+        pass
+
+    @abstractmethod
+    def reports_score(self) -> bool:
+        """
+        True if output_handler makes use of TranslatorOutput.score
+        :return:
         """
         pass
 
@@ -78,8 +97,8 @@ class StringOutputHandler(OutputHandler):
         self.stream = stream
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -88,6 +107,90 @@ class StringOutputHandler(OutputHandler):
         """
         self.stream.write("%s\n" % t_output.translation)
         self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return False
+
+
+class StringWithScoreOutputHandler(OutputHandler):
+    """
+    Output handler to write translation score and translation to a stream. The score and translation
+    string are tab-delimited.
+
+    :param stream: Stream to write translations to (e.g. sys.stdout).
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        :param t_input: Translator input.
+        :param t_output: Translator output.
+        :param t_walltime: Total walltime for translation.
+        """
+        self.stream.write("{:.3f}\t{}\n".format(t_output.score, t_output.translation))
+        self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return True
+
+
+class ScoreOutputHandler(OutputHandler):
+    """
+    Output handler to write translation score to a stream.
+
+    :param stream: Stream to write translations to (e.g., sys.stdout).
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        :param t_input: Translator input.
+        :param t_output: Translator output.
+        :param t_walltime: Total walltime for translation.
+        """
+        self.stream.write("{:.3f}\n".format(t_output.score))
+        self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return True
+
+
+class PairWithScoreOutputHandler(OutputHandler):
+    """
+    Output handler to write translation score along with sentence input and output (tab-delimited).
+
+    :param stream: Stream to write translations to (e.g., sys.stdout).
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        :param t_input: Translator input.
+        :param t_output: Translator output.
+        :param t_walltime: Total walltime for translation.
+        """
+        self.stream.write("{:.3f}\t{}\t{}\n".format(t_output.score,
+                                                    C.TOKEN_SEPARATOR.join(t_input.tokens),
+                                                    t_output.translation))
+        self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return True
 
 
 class StringWithAlignmentsOutputHandler(StringOutputHandler):
@@ -107,8 +210,8 @@ class StringWithAlignmentsOutputHandler(StringOutputHandler):
         self.threshold = threshold
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -119,6 +222,9 @@ class StringWithAlignmentsOutputHandler(StringOutputHandler):
             ["%d-%d" % (s, t) for s, t in get_alignments(t_output.attention_matrix, threshold=self.threshold)])
         self.stream.write("%s\t%s\n" % (t_output.translation, alignments))
         self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return False
 
 
 class StringWithAlignmentMatrixOutputHandler(StringOutputHandler):
@@ -145,16 +251,16 @@ class StringWithAlignmentMatrixOutputHandler(StringOutputHandler):
         super().__init__(stream)
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
         :param t_output: Translator output.
         :param t_walltime: Total wall-clock time for translation.
         """
-        line = "{sent_id:d} ||| {target} ||| {score:f} ||| {source} ||| {source_len:d} ||| {target_len:d}\n"
-        self.stream.write(line.format(sent_id=t_input.id,
+        line = "{sent_id} ||| {target} ||| {score:f} ||| {source} ||| {source_len:d} ||| {target_len:d}\n"
+        self.stream.write(line.format(sent_id=t_input.sentence_id,
                                       target=" ".join(t_output.tokens),
                                       score=t_output.score,
                                       source=" ".join(t_input.tokens),
@@ -169,17 +275,18 @@ class StringWithAlignmentMatrixOutputHandler(StringOutputHandler):
         self.stream.write("\n")
         self.stream.flush()
 
+    def reports_score(self) -> bool:
+        return True
+
 
 class BenchmarkOutputHandler(StringOutputHandler):
     """
     Output handler to write detailed benchmark information to a stream.
-
-    :param stream: Stream to write translations to (e.g. sys.stdout).
     """
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -187,12 +294,15 @@ class BenchmarkOutputHandler(StringOutputHandler):
         :param t_walltime: Total walltime for translation.
         """
         self.stream.write("input=%s\toutput=%s\tinput_tokens=%d\toutput_tokens=%d\ttranslation_time=%0.4f\n" %
-                          (t_input.sentence,
+                          (" ".join(t_input.tokens),
                            t_output.translation,
                            len(t_input.tokens),
                            len(t_output.tokens),
                            t_walltime))
         self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return False
 
 
 class AlignPlotHandler(OutputHandler):
@@ -206,8 +316,8 @@ class AlignPlotHandler(OutputHandler):
         self.plot_prefix = plot_prefix
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -217,7 +327,10 @@ class AlignPlotHandler(OutputHandler):
         plot_attention(t_output.attention_matrix,
                        t_input.tokens,
                        t_output.tokens,
-                       "%s_%d.png" % (self.plot_prefix, t_input.id))
+                       "%s_%s.png" % (self.plot_prefix, t_input.sentence_id))
+
+    def reports_score(self) -> bool:
+        return False
 
 
 class AlignTextHandler(OutputHandler):
@@ -231,8 +344,8 @@ class AlignTextHandler(OutputHandler):
         self.threshold = threshold
 
     def handle(self,
-               t_input: sockeye.inference.TranslatorInput,
-               t_output: sockeye.inference.TranslatorOutput,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
                t_walltime: float = 0.):
         """
         :param t_input: Translator input.
@@ -243,3 +356,64 @@ class AlignTextHandler(OutputHandler):
                              t_input.tokens,
                              t_output.tokens,
                              self.threshold)
+
+    def reports_score(self) -> bool:
+        return False
+
+
+class BeamStoringHandler(OutputHandler):
+    """
+    Output handler to store beam histories in JSON format.
+
+    :param stream: Stream to write translations to (e.g. sys.stdout).
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        :param t_input: Translator input.
+        :param t_output: Translator output.
+        :param t_walltime: Total wall-clock time for translation.
+        """
+        assert len(t_output.beam_histories) >= 1, "Translator output should contain beam histories."
+        # If the sentence was max_len split, we may have more than one history
+        for h in t_output.beam_histories:
+            # Add the number of steps in each beam
+            h["number_steps"] = len(h["predicted_tokens"])  # type: ignore
+            # Some outputs can have more than one beam, add the id for bookkeeping
+            h["id"] = t_output.sentence_id  # type: ignore
+            self.stream.write("%s\n" % json.dumps(h, sort_keys=True))
+        self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return False
+
+class JSONOutputHandler(OutputHandler):
+    """
+    Output single-line JSON objects.
+    Carries over extra fields from the input.
+    """
+    def __init__(self, stream, threshold: float = 0.0) -> None:
+        self.stream = stream
+        self.align_threshold = threshold
+
+    def handle(self,
+               t_input: inference.TranslatorInput,
+               t_output: inference.TranslatorOutput,
+               t_walltime: float = 0.):
+        """
+        Outputs a JSON object of the fields in the `TranslatorOutput` object.
+        """
+
+        d_ = t_output.json(self.align_threshold)
+
+        self.stream.write("%s\n" % json.dumps(d_, sort_keys=True))
+        self.stream.flush()
+
+    def reports_score(self) -> bool:
+        return True

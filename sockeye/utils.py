@@ -14,10 +14,11 @@
 """
 A set of utility methods.
 """
-import argparse
-import collections
+import binascii
 import errno
-import fcntl
+import glob
+import gzip
+import itertools
 import logging
 import os
 import random
@@ -25,15 +26,17 @@ import shutil
 import subprocess
 import sys
 import time
+import sockeye.multiprocessing_utils as mp_utils
+import multiprocessing
 from contextlib import contextmanager, ExitStack
-from typing import Mapping, NamedTuple, Any, List, Iterator, Set, TextIO, Tuple, Dict, Optional
+from typing import Mapping, Any, List, Iterator, Iterable, Set, Tuple, Dict, Optional, Union, IO, TypeVar, cast
 
 import mxnet as mx
 import numpy as np
+import portalocker
 
-import sockeye.constants as C
-from sockeye import __version__
-from sockeye.log import log_sockeye_version, log_mxnet_version
+from . import __version__, constants as C
+from .log import log_sockeye_version, log_mxnet_version
 
 logger = logging.getLogger(__name__)
 
@@ -94,15 +97,15 @@ def log_basic_info(args) -> None:
     logger.info("Arguments: %s", args)
 
 
-def seedRNGs(args: argparse.Namespace) -> None:
+def seed_rngs(seed: int) -> None:
     """
     Seed the random number generators (Python, Numpy and MXNet)
 
-    :param args: Arguments as returned by argparse.
+    :param seed: The random seed.
     """
-    np.random.seed(args.seed)
-    random.seed(args.seed)
-    mx.random.seed(args.seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    mx.random.seed(seed)
 
 
 def check_condition(condition: bool, error_message: str):
@@ -131,12 +134,12 @@ def save_graph(symbol: mx.sym.Symbol, filename: str, hide_weights: bool = True):
 
 def compute_lengths(sequence_data: mx.sym.Symbol) -> mx.sym.Symbol:
     """
-    Computes sequence lenghts of PAD_ID-padded data in sequence_data.
+    Computes sequence lengths of PAD_ID-padded data in sequence_data.
 
     :param sequence_data: Input data. Shape: (batch_size, seq_len).
     :return: Length data. Shape: (batch_size,).
     """
-    return mx.sym.sum(mx.sym.broadcast_not_equal(sequence_data, mx.sym.zeros((1,))), axis=1)
+    return mx.sym.sum(sequence_data != C.PAD_ID, axis=1)
 
 
 def save_params(arg_params: Mapping[str, mx.nd.NDArray], fname: str,
@@ -167,7 +170,16 @@ def load_params(fname: str) -> Tuple[Dict[str, mx.nd.NDArray], Dict[str, mx.nd.N
     for k, v in save_dict.items():
         tp, name = k.split(':', 1)
         if tp == 'arg':
-            arg_params[name] = v
+            """TODO(fhieber):
+            temporary weight split for models with combined weight for keys & values
+            in transformer source attention layers. This can be removed once with the next major version change."""
+            if "att_enc_kv2h_weight" in name:
+                logger.info("Splitting '%s' parameters into separate k & v matrices.", name)
+                v_split = mx.nd.split(v, axis=0, num_outputs=2)
+                arg_params[name.replace('kv2h', "k2h")] = v_split[0]
+                arg_params[name.replace('kv2h', "v2h")] = v_split[1]
+            else:
+                arg_params[name] = v
         if tp == 'aux':
             aux_params[name] = v
     return arg_params, aux_params
@@ -213,45 +225,136 @@ class Accuracy(mx.metric.EvalMetric):
             self.num_inst += n
 
 
-def smallest_k(matrix: np.ndarray, k: int,
-               only_first_row: bool = False) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
-    """
-    Find the smallest elements in a numpy matrix.
+class OnlineMeanAndVariance:
+    def __init__(self) -> None:
+        self._count = 0
+        self._mean = 0.
+        self._M2 = 0.
 
-    :param matrix: Any matrix.
-    :param k: The number of smallest elements to return.
-    :param only_first_row: If true the search is constrained to the first row of the matrix.
+    def update(self, value: Union[float, int]) -> None:
+        self._count += 1
+        delta = value - self._mean
+        self._mean += delta / self._count
+        delta2 = value - self._mean
+        self._M2 += delta * delta2
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    @property
+    def mean(self) -> float:
+        return self._mean
+
+    @property
+    def variance(self) -> float:
+        if self._count < 2:
+            return float('nan')
+        else:
+            return self._M2 / self._count
+
+
+def top1(scores: mx.nd.NDArray,
+         offset: mx.nd.NDArray) -> Tuple[mx.nd.NDArray, mx.nd.NDArray, mx.nd.NDArray]:
+    """
+    Get the single lowest element per sentence from a `scores` matrix. Expects that
+    beam size is 1, for greedy decoding.
+
+    NOTE(mathmu): The current implementation of argmin in MXNet much slower than topk with k=1.
+
+    :param scores: Vocabulary scores for the next beam step. (batch_size * beam_size, target_vocabulary_size)
+    :param offset: Array to add to the hypothesis indices for offsetting in batch decoding.
+    :return: The row indices, column indices and values of the smallest items in matrix.
+    """
+    best_word_indices = mx.nd.cast(mx.nd.argmin(scores, axis=1), dtype='int32')
+    values = scores[mx.nd.arange(scores.shape[0], dtype='int32', ctx=scores.context), best_word_indices]
+
+    values = values.reshape((-1, 1))
+
+    # for top1, the best hyp indices are equal to the plain offset
+
+    return offset, best_word_indices, values
+
+
+def topk(scores: mx.nd.NDArray,
+         offset: mx.nd.NDArray,
+         k: int) -> Tuple[mx.nd.NDArray, mx.nd.NDArray, mx.nd.NDArray]:
+    """
+    Get the lowest k elements per sentence from a `scores` matrix.
+    At the first timestep, the shape of scores is (batch, target_vocabulary_size).
+    At subsequent steps, the shape is (batch * k, target_vocabulary_size).
+
+    :param scores: Vocabulary scores for the next beam step. (batch_size * beam_size, target_vocabulary_size)
+    :param offset: Array (shape: batch_size * k) containing offsets to add to the hypothesis indices in batch decoding.
+    :param k: The number of smallest scores to return.
     :return: The row indices, column indices and values of the k smallest items in matrix.
     """
-    if only_first_row:
-        flatten = matrix[:1, :].flatten()
+
+    # Compute the batch size from the offsets and k. We don't know the batch size because it is
+    # either 1 (at timestep 1) or k (at timesteps 2+).
+    # (batch_size, beam_size * target_vocab_size)
+    batch_size = int(offset.shape[-1] / k)
+    folded_scores = scores.reshape((batch_size, -1))
+
+    # pylint: disable=unbalanced-tuple-unpacking
+    values, indices = mx.nd.topk(folded_scores, axis=1, k=k, ret_typ='both', is_ascend=True)
+    indices = mx.nd.cast(indices, 'int32').reshape((-1,))
+    best_hyp_indices, best_word_indices = mx.nd.unravel_index(indices, shape=(batch_size * k, scores.shape[-1]))
+
+    if batch_size > 1:
+        # Offsetting the indices to match the shape of the scores matrix
+        best_hyp_indices += offset
+
+    values = values.reshape((-1, 1))
+    return best_hyp_indices, best_word_indices, values
+
+
+def chunks(some_list: List, n: int) -> Iterable[List]:
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(some_list), n):
+        yield some_list[i:i + n]
+
+
+def get_tokens(line: str) -> Iterator[str]:
+    """
+    Yields tokens from input string.
+
+    :param line: Input string.
+    :return: Iterator over tokens.
+    """
+    for token in line.rstrip().split():
+        if len(token) > 0:
+            yield token
+
+
+def is_gzip_file(filename: str) -> bool:
+    # check for magic gzip number
+    with open(filename, 'rb') as test_f:
+        return binascii.hexlify(test_f.read(2)) == b'1f8b'
+
+
+def smart_open(filename: str, mode: str = "rt", ftype: str = "auto", errors: str = 'replace'):
+    """
+    Returns a file descriptor for filename with UTF-8 encoding.
+    If mode is "rt", file is opened read-only.
+    If ftype is "auto", uses gzip iff filename endswith .gz.
+    If ftype is {"gzip","gz"}, uses gzip.
+    If ftype is "auto" and read mode requested, uses gzip iff is_gzip_file(filename).
+
+    Note: encoding error handling defaults to "replace"
+
+    :param filename: The filename to open.
+    :param mode: Reader mode.
+    :param ftype: File type. If 'auto' checks filename suffix for gz to try gzip.open.
+    :param errors: Encoding error handling during reading. Defaults to 'replace'.
+    :return: File descriptor.
+    """
+    if ftype in ('gzip', 'gz') \
+            or (ftype == 'auto' and filename.endswith(".gz")) \
+            or (ftype == 'auto' and 'r' in mode and is_gzip_file(filename)):
+        return gzip.open(filename, mode=mode, encoding='utf-8', errors=errors)
     else:
-        flatten = matrix.flatten()
-
-    # args are the indices in flatten of the k smallest elements
-    args = np.argpartition(flatten, k)[:k]
-    # args are the indices in flatten of the sorted k smallest elements
-    args = args[np.argsort(flatten[args])]
-    # flatten[args] are the values for args
-    return np.unravel_index(args, matrix.shape), flatten[args]
-
-
-def smallest_k_mx(matrix: mx.nd.NDArray, k: int,
-                  only_first_row: bool = False) -> Tuple[Tuple[np.ndarray, np.ndarray], np.ndarray]:
-    """
-    Find the smallest elements in a NDarray.
-
-    :param matrix: Any matrix.
-    :param k: The number of smallest elements to return.
-    :param only_first_row: If True the search is constrained to the first row of the matrix.
-    :return: The row indices, column indices and values of the k smallest items in matrix.
-    """
-    if only_first_row:
-        matrix = mx.nd.reshape(matrix[0], shape=(1, -1))
-
-    values, indices = mx.nd.topk(matrix, axis=None, k=k, ret_typ='both', is_ascend=True)
-
-    return np.unravel_index(indices.astype(np.int32).asnumpy(), matrix.shape), values
+        return open(filename, mode=mode, encoding='utf-8', errors=errors)
 
 
 def plot_attention(attention_matrix: np.ndarray, source_tokens: List[str], target_tokens: List[str], filename: str):
@@ -263,7 +366,10 @@ def plot_attention(attention_matrix: np.ndarray, source_tokens: List[str], targe
     :param target_tokens: A list of target tokens.
     :param filename: The file to which the attention visualization will be written to.
     """
-    import matplotlib
+    try:
+        import matplotlib
+    except ImportError:
+        raise RuntimeError("Please install matplotlib.")
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     assert attention_matrix.shape[0] == len(target_tokens)
@@ -340,32 +446,55 @@ def average_arrays(arrays: List[mx.nd.NDArray]) -> mx.nd.NDArray:
     :param arrays: A list of NDArrays with the same shape that will be averaged.
     :return: The average of the NDArrays in the same context as arrays[0].
     """
+    if not arrays:
+        raise ValueError("arrays is empty.")
     if len(arrays) == 1:
         return arrays[0]
     check_condition(all(arrays[0].shape == a.shape for a in arrays), "nd array shapes do not match")
-    new_array = mx.nd.zeros(arrays[0].shape, dtype=arrays[0].dtype, ctx=arrays[0].context)
-    for a in arrays:
-        new_array += a.as_in_context(new_array.context)
-    new_array /= len(arrays)
-    return new_array
+    return mx.nd.add_n(*arrays) / len(arrays)
 
 
 def get_num_gpus() -> int:
     """
-    Gets the number of GPUs available on the host (depends on nvidia-smi).
+    Gets the number of GPUs available on the host.
 
     :return: The number of GPUs on the system.
     """
-    if shutil.which("nvidia-smi") is None:
-        logger.warning("Couldn't find nvidia-smi, therefore we assume no GPUs are available.")
-        return 0
-    sp = subprocess.Popen(['nvidia-smi', '-L'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    out_str = sp.communicate()[0].decode("utf-8")
-    num_gpus = len(out_str.rstrip("\n").split("\n"))
-    return num_gpus
+    return mx.context.num_gpus()
 
 
-def get_gpu_memory_usage(ctx: List[mx.context.Context]) -> Optional[Dict[int, Tuple[int, int]]]:
+def query_nvidia_smi(device_ids: List[int], result_queue: multiprocessing.Queue) -> None:
+    """
+    Runs nvidia-smi to determine the memory usage.
+
+    :param device_ids: A list of devices for which the the memory usage will be queried.
+    :param result_queue: The queue to which the result dictionary of device id mapping to a tuple of
+    (memory used, memory total) is added.
+    """
+    device_id_strs = [str(device_id) for device_id in device_ids]
+    query = "--query-gpu=index,memory.used,memory.total"
+    format_arg = "--format=csv,noheader,nounits"
+    try:
+        sp = subprocess.Popen(['nvidia-smi', query, format_arg, "-i", ",".join(device_id_strs)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        result = sp.communicate()[0].decode("utf-8").rstrip().split("\n")
+    except OSError:
+        logger.exception("Failed calling nvidia-smi to query memory usage.")
+        result_queue.put({})
+        return
+    try:
+        memory_data = {}
+        for line in result:
+            gpu_id, mem_used, mem_total = line.split(",")
+            memory_data[int(gpu_id)] = (int(mem_used), int(mem_total))
+
+        result_queue.put(memory_data)
+    except:
+        logger.exception("Failed parsing nvidia-smi output %s", "\n".join(result))
+        result_queue.put({})
+
+
+def get_gpu_memory_usage(ctx: List[mx.context.Context]) -> Dict[int, Tuple[int, int]]:
     """
     Returns used and total memory for GPUs identified by the given context list.
 
@@ -376,26 +505,61 @@ def get_gpu_memory_usage(ctx: List[mx.context.Context]) -> Optional[Dict[int, Tu
         ctx = [ctx]
     ctx = [c for c in ctx if c.device_type == 'gpu']
     if not ctx:
-        return None
+        return {}
     if shutil.which("nvidia-smi") is None:
         logger.warning("Couldn't find nvidia-smi, therefore we assume no GPUs are available.")
         return {}
-    ids = [str(c.device_id) for c in ctx]
-    query = "--query-gpu=index,memory.used,memory.total"
-    format = "--format=csv,noheader,nounits"
-    sp = subprocess.Popen(['nvidia-smi', query, format, "-i", ",".join(ids)],
-                          stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    result = sp.communicate()[0].decode("utf-8").rstrip().split("\n")
-    memory_data = {}
-    for line in result:
-        gpu_id, mem_used, mem_total = line.split(",")
-        memory_data[int(gpu_id)] = (int(mem_used), int(mem_total))
+
+    device_ids = [c.device_id for c in ctx]
+
+    # Run from clean forkserver process to not leak any CUDA resources
+
+    mp_context = mp_utils.get_context()
+    result_queue = mp_context.Queue()
+    nvidia_smi_process = mp_context.Process(target=query_nvidia_smi, args=(device_ids, result_queue,))
+    nvidia_smi_process.start()
+    nvidia_smi_process.join()
+
+    memory_data = result_queue.get()
+
+    log_gpu_memory_usage(memory_data)
+
     return memory_data
 
 
 def log_gpu_memory_usage(memory_data: Dict[int, Tuple[int, int]]):
-    log_str = " ".join("GPU %d: %d/%d MB (%.2f%%)" %(k, v[0], v[1], v[0] * 100.0/v[1]) for k, v in memory_data.items())
+    log_str = " ".join(
+        "GPU %d: %d/%d MB (%.2f%%)" % (k, v[0], v[1], v[0] * 100.0 / v[1]) for k, v in memory_data.items())
     logger.info(log_str)
+
+
+def determine_context(device_ids: List[int],
+                      use_cpu: bool,
+                      disable_device_locking: bool,
+                      lock_dir: str,
+                      exit_stack: ExitStack) -> List[mx.Context]:
+    """
+    Determine the MXNet context to run on (CPU or GPU).
+
+    :param device_ids: List of device as defined from the CLI.
+    :param use_cpu: Whether to use the CPU instead of GPU(s).
+    :param disable_device_locking: Disable Sockeye's device locking feature.
+    :param lock_dir: Directory to place device lock files in.
+    :param exit_stack: An ExitStack from contextlib.
+    :return: A list with the context(s) to run on.
+    """
+    if use_cpu:
+        context = [mx.cpu()]
+    else:
+        num_gpus = get_num_gpus()
+        check_condition(num_gpus >= 1,
+                        "No GPUs found, consider running on the CPU with --use-cpu ")
+        if disable_device_locking:
+            context = expand_requested_device_ids(device_ids)
+        else:
+            context = exit_stack.enter_context(acquire_gpus(device_ids, lock_dir=lock_dir))
+        context = [mx.gpu(gpu_id) for gpu_id in context]
+    return context
 
 
 def expand_requested_device_ids(requested_device_ids: List[int]) -> List[int]:
@@ -409,6 +573,8 @@ def expand_requested_device_ids(requested_device_ids: List[int]) -> List[int]:
     :return: A list of device ids.
     """
     num_gpus_available = get_num_gpus()
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        logger.warning("Sockeye currently does not respect CUDA_VISIBLE_DEVICE settings when locking GPU devices.")
     return _expand_requested_device_ids(requested_device_ids, num_gpus_available)
 
 
@@ -435,7 +601,7 @@ def _expand_requested_device_ids(requested_device_ids: List[int], num_gpus_avail
 @contextmanager
 def acquire_gpus(requested_device_ids: List[int], lock_dir: str = "/tmp",
                  retry_wait_min: int = 10, retry_wait_rand: int = 60,
-                 num_gpus_available: Optional[int]=None):
+                 num_gpus_available: Optional[int] = None):
     """
     Acquire a number of GPUs in a transactional way. This method should be used inside a `with` statement.
     Will try to acquire all the requested number of GPUs. If currently
@@ -492,33 +658,44 @@ def acquire_gpus(requested_device_ids: List[int], lock_dir: str = "/tmp",
     candidates_to_request += [remaining_device_ids for _ in range(num_arbitrary_device_ids)]
 
     while True:
+
         with ExitStack() as exit_stack:
-            acquired_gpus = []  # type: List[int]
             any_failed = False
-            for candidates in candidates_to_request:
-                gpu_id = exit_stack.enter_context(GpuFileLock(candidates=candidates, lock_dir=lock_dir))
-                if gpu_id is not None:
-                    acquired_gpus.append(gpu_id)
-                else:
-                    if len(candidates) == 1:
-                        logger.info("Could not acquire GPU %d. It's currently locked.", candidates[0])
-                    any_failed = True
-                    break
-            if not any_failed:
+            acquired_gpus = []  # type: List[int]
+            with GpuFileLock(candidates=["master_lock"], lock_dir=lock_dir) as master_lock:  # type: str
+                # Only one process, determined by the master lock, can try acquiring gpu locks at a time.
+                # This will make sure that we use consecutive device ids whenever possible.
+                if master_lock is not None:
+                    for candidates in candidates_to_request:
+                        gpu_id = exit_stack.enter_context(GpuFileLock(candidates=candidates, lock_dir=lock_dir))
+                        if gpu_id is not None:
+                            acquired_gpus.append(cast(int, gpu_id))
+                        else:
+                            if len(candidates) == 1:
+                                logger.info("Could not acquire GPU %d. It's currently locked.", candidates[0])
+                            any_failed = True
+                            break
+            if master_lock is not None and not any_failed:
                 try:
                     yield acquired_gpus
-                except:
+                except:  # pylint: disable=try-except-raise
                     raise
                 return
-        # couldn't acquire all GPUs, let's wait and try again later
 
         # randomize so that multiple processes starting at the same time don't retry at a similar point in time
         if retry_wait_rand > 0:
             retry_wait_actual = retry_wait_min + random.randint(0, retry_wait_rand)
         else:
             retry_wait_actual = retry_wait_min
-        logger.info("Not enough GPUs available will try again in %ss." % retry_wait_actual)
+
+        if master_lock is None:
+            logger.info("Another process is acquiring GPUs at the moment will try again in %ss." % retry_wait_actual)
+        else:
+            logger.info("Not enough GPUs available will try again in %ss." % retry_wait_actual)
         time.sleep(retry_wait_actual)
+
+
+GpuDeviceType = TypeVar('GpuDeviceType')
 
 
 class GpuFileLock:
@@ -530,21 +707,27 @@ class GpuFileLock:
     :param lock_dir: The directory for storing the lock file.
     """
 
-    def __init__(self, candidates: List[int], lock_dir: str) -> None:
+    def __init__(self, candidates: List[GpuDeviceType], lock_dir: str) -> None:
         self.candidates = candidates
         self.lock_dir = lock_dir
-        self.lock_file = None  # type: Optional[TextIO]
+        self.lock_file = None  # type: Optional[IO[Any]]
         self.lock_file_path = None  # type: Optional[str]
-        self.gpu_id = None  # type: Optional[int]
+        self.gpu_id = None  # type: Optional[GpuDeviceType]
         self._acquired_lock = False
 
-    def __enter__(self) -> Optional[int]:
+    def __enter__(self) -> Optional[GpuDeviceType]:
         for gpu_id in self.candidates:
-            lockfile_path = os.path.join(self.lock_dir, "sockeye.gpu%d.lock" % gpu_id)
-            lock_file = open(lockfile_path, 'w')
+            lockfile_path = os.path.join(self.lock_dir, "sockeye.gpu{}.lock".format(gpu_id))
+            try:
+                lock_file = open(lockfile_path, 'w')
+            except IOError:
+                if errno.EACCES:
+                    logger.warning("GPU {} is currently locked by a different process "
+                                   "(Permission denied).".format(gpu_id))
+                    continue
             try:
                 # exclusive non-blocking lock
-                fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                portalocker.lock(lock_file, portalocker.LOCK_EX | portalocker.LOCK_NB)
                 # got the lock, let's write our PID into it:
                 lock_file.write("%d\n" % os.getpid())
                 lock_file.flush()
@@ -554,45 +737,49 @@ class GpuFileLock:
                 self.lock_file = lock_file
                 self.lockfile_path = lockfile_path
 
-                logger.info("Acquired GPU %d." % gpu_id)
+                logger.info("Acquired GPU {}.".format(gpu_id))
 
                 return gpu_id
-            except IOError as e:
-                # raise on unrelated IOErrors
-                if e.errno != errno.EAGAIN:
+            except portalocker.LockException as e:
+                # portalocker packages the original exception,
+                # we dig it out and raise if unrelated to us
+                if e.args[0].errno != errno.EAGAIN:  # pylint: disable=no-member
                     logger.error("Failed acquiring GPU lock.", exc_info=True)
-                    raise
+                    raise e.args[0]
                 else:
-                    logger.debug("GPU %d is currently locked.", gpu_id)
+                    logger.debug("GPU {} is currently locked.".format(gpu_id))
         return None
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.gpu_id is not None:
-            logger.info("Releasing GPU %d.", self.gpu_id)
+            logger.info("Releasing GPU {}.".format(self.gpu_id))
         if self.lock_file is not None:
             if self._acquired_lock:
-                fcntl.flock(self.lock_file, fcntl.LOCK_UN)
+                portalocker.lock(self.lock_file, portalocker.LOCK_UN)
             self.lock_file.close()
             os.remove(self.lockfile_path)
 
 
-def namedtuple_with_defaults(typename, field_names, default_values: Mapping[str, Any] = ()) -> NamedTuple:
+def parse_metrics_line(line_number: int, line: str) -> Dict[str, Any]:
     """
-    Create a named tuple with default values.
+    Parse a line of metrics into a mappings of key and values.
 
-    :param typename: The name of the new type.
-    :param field_names: The fields the type will have.
-    :param default_values: A mapping from field names to default values.
-    :return: The new named tuple with default values.
+    :param line_number: Line's number for checking if checkpoints are aligned to it.
+    :param line: A line from the Sockeye metrics file.
+    :return: Dictionary of metric names (e.g. perplexity-train) mapping to a list of values.
     """
-    T = collections.namedtuple(typename, field_names)
-    T.__new__.__defaults__ = (None,) * len(T._fields)
-    if isinstance(default_values, collections.Mapping):
-        prototype = T(**default_values)
-    else:
-        prototype = T(*default_values)
-    T.__new__.__defaults__ = tuple(prototype)
-    return T
+    fields = line.split('\t')
+    checkpoint = int(fields[0])
+    check_condition(line_number == checkpoint,
+                    "Line (%d) and loaded checkpoint (%d) do not align." % (line_number, checkpoint))
+    metric = dict()  # type: Dict[str, Any]
+    for field in fields[1:]:
+        key, value = field.split("=", 1)
+        if value == 'True' or value == 'False':
+            metric[key] = (value == 'True')
+        else:
+            metric[key] = float(value)
+    return metric
 
 
 def read_metrics_file(path: str) -> List[Dict[str, Any]]:
@@ -602,18 +789,8 @@ def read_metrics_file(path: str) -> List[Dict[str, Any]]:
     :param path: File to read metric values from.
     :return: Dictionary of metric names (e.g. perplexity-train) mapping to a list of values.
     """
-    metrics = []
     with open(path) as fin:
-        for i, line in enumerate(fin, 1):
-            fields = line.strip().split('\t')
-            checkpoint = int(fields[0])
-            check_condition(i == checkpoint,
-                            "Line (%d) and loaded checkpoint (%d) do not align." % (i, checkpoint))
-            metric = dict()
-            for field in fields[1:]:
-                key, value = field.split("=", 1)
-                metric[key] = float(value)
-            metrics.append(metric)
+        metrics = [parse_metrics_line(i, line.strip()) for i, line in enumerate(fin, 1)]
     return metrics
 
 
@@ -626,8 +803,8 @@ def write_metrics_file(metrics: List[Dict[str, Any]], path: str):
     """
     with open(path, 'w') as metrics_out:
         for checkpoint, metric_dict in enumerate(metrics, 1):
-            metrics_str = "\t".join(["%s=%.6f" % (name, value) for name, value in sorted(metric_dict.items())])
-            metrics_out.write("%d\t%s\n" % (checkpoint, metrics_str))
+            metrics_str = "\t".join(["{}={}".format(name, value) for name, value in sorted(metric_dict.items())])
+            metrics_out.write("{}\t{}\n".format(checkpoint, metrics_str))
 
 
 def get_validation_metric_points(model_path: str, metric: str):
@@ -640,3 +817,194 @@ def get_validation_metric_points(model_path: str, metric: str):
     metrics_path = os.path.join(model_path, C.METRICS_NAME)
     data = read_metrics_file(metrics_path)
     return [(d['%s-val' % metric], cp) for cp, d in enumerate(data, 1)]
+
+
+class PrintValue(mx.operator.CustomOp):
+    """
+    Custom operator that takes a symbol, prints its value to stdout and
+    propagates the value unchanged. Useful for debugging.
+
+    Use it as:
+    my_sym = mx.sym.Custom(op_type="PrintValue", data=my_sym, print_name="My symbol")
+
+    Additionally you can use the optional arguments 'use_logger=True' for using
+    the system logger and 'print_grad=True' for printing information about the
+    gradient (out_grad, i.e. "upper part" of the graph).
+    """
+
+    def __init__(self, print_name, print_grad: str, use_logger: str) -> None:
+        super().__init__()
+        self.print_name = print_name
+        # Note that all the parameters are serialized as strings
+        self.print_grad = (print_grad == "True")
+        self.use_logger = (use_logger == "True")
+
+    def __print_nd__(self, nd: mx.nd.array, label: str):
+        intro = "%s %s - shape %s" % (label, self.print_name, str(nd.shape))
+        if self.use_logger:
+            logger.info(intro)
+            logger.info(str(nd.asnumpy()))
+        else:
+            print(">>>>> ", intro)
+            print(nd.asnumpy())
+
+    def forward(self, is_train, req, in_data, out_data, aux):
+        self.__print_nd__(in_data[0], "Symbol")
+        self.assign(out_data[0], req[0], in_data[0])
+
+    def backward(self, req, out_grad, in_data, out_data, in_grad, aux):
+        if self.print_grad:
+            self.__print_nd__(out_grad[0], "Grad")
+        self.assign(in_grad[0], req[0], out_grad[0])
+
+
+@mx.operator.register("PrintValue")
+class PrintValueProp(mx.operator.CustomOpProp):
+    def __init__(self, print_name: str, print_grad: bool = False, use_logger: bool = False) -> None:
+        super().__init__(need_top_grad=True)
+        self.print_name = print_name
+        self.print_grad = print_grad
+        self.use_logger = use_logger
+
+    def list_arguments(self):
+        return ["data"]
+
+    def list_outputs(self):
+        return ["output"]
+
+    def infer_shape(self, in_shape):
+        return in_shape, in_shape, []
+
+    def infer_type(self, in_type):
+        return in_type, in_type, []
+
+    def create_operator(self, ctx, shapes, dtypes):
+        return PrintValue(self.print_name,
+                          print_grad=str(self.print_grad),
+                          use_logger=str(self.use_logger))
+
+
+def grouper(iterable: Iterable, size: int) -> Iterable:
+    """
+    Collect data into fixed-length chunks or blocks without discarding underfilled chunks or padding them.
+
+    :param iterable: A sequence of inputs.
+    :param size: Chunk size.
+    :return: Sequence of chunks.
+    """
+    it = iter(iterable)
+    while True:
+        chunk = list(itertools.islice(it, size))
+        if not chunk:
+            return
+        yield chunk
+
+
+def metric_value_is_better(new: float, old: float, metric: str) -> bool:
+    """
+    Returns true if new value is strictly better than old for given metric.
+    """
+    if C.METRIC_MAXIMIZE[metric]:
+        return new > old
+    else:
+        return new < old
+
+
+def cleanup_params_files(output_folder: str, max_to_keep: int, checkpoint: int, best_checkpoint: int, keep_first: bool):
+    """
+    Deletes oldest parameter files from a model folder.
+
+    :param output_folder: Folder where param files are located.
+    :param max_to_keep: Maximum number of files to keep, negative to keep all.
+    :param checkpoint: Current checkpoint (i.e. index of last params file created).
+    :param best_checkpoint: Best checkpoint. The parameter file corresponding to this checkpoint will not be deleted.
+    :param keep_first: Don't delete the first checkpoint.
+    """
+    if max_to_keep <= 0:
+        return
+    existing_files = glob.glob(os.path.join(output_folder, C.PARAMS_PREFIX + "*"))
+    params_name_with_dir = os.path.join(output_folder, C.PARAMS_NAME)
+    for n in range(1 if keep_first else 0, max(1, checkpoint - max_to_keep + 1)):
+        if n != best_checkpoint:
+            param_fname_n = params_name_with_dir % n
+            if param_fname_n in existing_files:
+                os.remove(param_fname_n)
+
+
+def cast_conditionally(data: mx.sym.Symbol, dtype: str) -> mx.sym.Symbol:
+    """
+    Workaround until no-op cast will be fixed in MXNet codebase.
+    Creates cast symbol only if dtype is different from default one, i.e. float32.
+
+    :param data: Input symbol.
+    :param dtype: Target dtype.
+    :return: Cast symbol or just data symbol.
+    """
+    if dtype != C.DTYPE_FP32:
+        return mx.sym.cast(data=data, dtype=dtype)
+    return data
+
+
+def uncast_conditionally(data: mx.sym.Symbol, dtype: str) -> mx.sym.Symbol:
+    """
+    Workaround until no-op cast will be fixed in MXNet codebase.
+    Creates cast to float32 symbol only if dtype is different from default one, i.e. float32.
+
+    :param data: Input symbol.
+    :param dtype: Input symbol dtype.
+    :return: Cast symbol or just data symbol.
+    """
+    if dtype != C.DTYPE_FP32:
+        return mx.sym.cast(data=data, dtype=C.DTYPE_FP32)
+    return data
+
+
+def split(data: mx.nd.NDArray,
+          num_outputs: int,
+          axis: int = 1,
+          squeeze_axis: bool = False) -> List[mx.nd.NDArray]:
+    """
+    Version of mxnet.ndarray.split that always returns a list.  The original
+    implementation only returns a list if num_outputs > 1:
+    https://mxnet.incubator.apache.org/api/python/ndarray/ndarray.html#mxnet.ndarray.split
+
+    Splits an array along a particular axis into multiple sub-arrays.
+
+    :param data: The input.
+    :param num_outputs: Number of splits. Note that this should evenly divide
+                        the length of the axis.
+    :param axis: Axis along which to split.
+    :param squeeze_axis: If true, Removes the axis with length 1 from the shapes
+                         of the output arrays.
+    :return: List of NDArrays resulting from the split.
+    """
+    ndarray_or_list = data.split(num_outputs=num_outputs, axis=axis, squeeze_axis=squeeze_axis)
+    if num_outputs == 1:
+        return [ndarray_or_list]
+    return ndarray_or_list
+
+
+def inflect(word: str,
+            count: int):
+    """
+    Minimal inflection module.
+
+    :param word: The word to inflect.
+    :param count: The count.
+    :return: The word, perhaps inflected for number.
+    """
+    if word in ['time', 'sentence']:
+        return word if count == 1 else word + 's'
+    elif word == 'was':
+        return 'was' if count == 1 else 'were'
+    else:
+        return word + '(s)'
+
+
+def isfinite(data: mx.nd.NDArray) -> mx.nd.NDArray:
+    """Performs an element-wise check to determine if the NDArray contains an infinite element or not.
+       TODO: remove this funciton after upgrade to MXNet 1.4.* in favor of mx.ndarray.contrib.isfinite()
+    """
+    is_data_not_nan = data == data
+    is_data_not_infinite = data.abs() != np.inf
+    return mx.nd.logical_and(is_data_not_infinite, is_data_not_nan)
