@@ -1593,7 +1593,7 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
                          source_data_name=source_data_name, target_data_name=target_data_name,
                          label_name=label_name, num_factors=num_factors, dtype=dtype)
         assert len(shards_fnames) > 0
-        self.max_shard_complexity = 0
+        self.max_shard_complexity = len(self.shards_fnames) - 1
         self.update_max_shard_complexity = False
         self.shards_fnames = list(shards_fnames)
         self.shards_complexity = list(shards_complexity)
@@ -1624,7 +1624,10 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
         if self.update_max_shard_complexity:
             logger.info("** Updating complexity constraint (increased by 1)")
             logger.info("**** Old max complexity " + str(self.max_shard_complexity))
-            self.max_shard_complexity += 1
+            if self.max_shard_complexity > 1:
+                self.max_shard_complexity -= 1
+            else:
+                self.max_shard_complexity = 0
             logger.info("**** New max complexity " + str(self.max_shard_complexity))
             self.update_max_shard_complexity = False
         self.visible_shards_fnames = [self.shards_fnames[idx] for idx in range(len(self.shards_fnames))
@@ -1651,9 +1654,8 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
             self.shard_index = 0
             self._load_shard()
         else:
-            if self.shard_index < 0:
-                self.shard_index = 0
-                self._load_shard()
+            self.shard_index = 0
+            self._load_shard()
             # We can just reset the shard_iter as we only have a single shard
             self.shard_iter.reset()
 
