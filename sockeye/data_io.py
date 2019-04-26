@@ -1593,7 +1593,7 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
                          source_data_name=source_data_name, target_data_name=target_data_name,
                          label_name=label_name, num_factors=num_factors, dtype=dtype)
         assert len(shards_fnames) > 0
-        self.max_shard_complexity = len(self.shards_fnames) - 1
+        self.max_shard_complexity = len(list(shards_fnames)) - 1
         self.update_max_shard_complexity = False
         self.shards_fnames = list(shards_fnames)
         self.shards_complexity = list(shards_complexity)
@@ -1622,12 +1622,13 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
     def reset(self):
         # At each reset, given the complexity we are allowed, only a certain number of shards are visible
         if self.update_max_shard_complexity:
-            logger.info("** Updating complexity constraint (increased by 1)")
+            logger.info("** Updating complexity constraint (decreased by 1)")
             logger.info("**** Old max complexity " + str(self.max_shard_complexity))
             if self.max_shard_complexity > 1:
                 self.max_shard_complexity -= 1
             else:
                 self.max_shard_complexity = 0
+            last_shard_fname = self.visible_shards_fnames[self.shard_index]
             logger.info("**** New max complexity " + str(self.max_shard_complexity))
             self.update_max_shard_complexity = False
         self.visible_shards_fnames = [self.shards_fnames[idx] for idx in range(len(self.shards_fnames))
@@ -1643,7 +1644,7 @@ class CurriculumParallelSampleIter(BaseParallelSampleIter):
             if self.shard_index < 0:
                 current_shard_fname = ""
             else:
-                current_shard_fname = self.visible_shards_fnames[self.shard_index]
+                current_shard_fname = last_shard_fname
             remaining_shards = [shard for shard in self.visible_shards_fnames if shard != current_shard_fname]
             next_shard_fname = random.choice(remaining_shards)
             remaining_shards = [shard for shard in self.visible_shards_fnames if shard != next_shard_fname]
